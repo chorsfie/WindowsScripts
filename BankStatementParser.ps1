@@ -134,9 +134,7 @@ if (-not (Test-Path $combinedRoot)) { $combinedRoot = $rootPath }
 # Timestamped filenames
 $stamp = Get-Date -Format 'yyyy-MM-dd_HHmm'
 $outAllCsv          = Join-Path $combinedRoot "Bank_AllAccounts_$stamp.csv"
-$outMonthlyCsv      = Join-Path $combinedRoot "Bank_Summary_Monthly_$stamp.csv"
 $outTaxYearCsv      = Join-Path $combinedRoot "Bank_Summary_TaxYear_$stamp.csv"
-$outCalendarYearCsv = Join-Path $combinedRoot "Bank_Summary_CalendarYear_$stamp.csv"
 $outSummaryMd       = Join-Path $combinedRoot "Bank_Summary_Report_$stamp.md"
 
 # PDF discovery and diagnostic
@@ -160,9 +158,10 @@ Get-ChildItem -Path $rootPath -Filter *.pdf -Recurse |
         & $popplerPath -layout -enc UTF-8 $pdf $tempTxt 2>$null
         $lines = Get-Content -LiteralPath $tempTxt -Encoding UTF8
 
-        # Diagnostic: print first 10 lines of extracted text
-        Write-Host "[DIAGNOSTIC] First 10 lines of extracted text:" -ForegroundColor Cyan
-        $lines | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        if ($VerboseMode) {
+            Write-Host "[DIAGNOSTIC] First 10 lines of extracted text:" -ForegroundColor Cyan
+            $lines | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        }
 
         $accountNumber = $null
         $sortCode      = $null
@@ -191,7 +190,9 @@ Get-ChildItem -Path $rootPath -Filter *.pdf -Recurse |
 
         if ($bankName -eq 'Chase') {
             # --- Chase parsing logic ---
-            Write-Host "[DIAGNOSTIC] Parsing Chase file: $pdf" -ForegroundColor Cyan
+            if ($VerboseMode) {
+                Write-Host "[DIAGNOSTIC] Parsing Chase file: $pdf" -ForegroundColor Cyan
+            }
             $headerPatterns = @(
                 '^Date\s+Transaction',
                 '^Date\s+Transaction details',
@@ -224,54 +225,146 @@ Get-ChildItem -Path $rootPath -Filter *.pdf -Recurse |
                 if ($line -match "^(?<Date>\d{1,2}\s+\w{3}\s+\d{2,4})(?<Rest>.*)$") {
                     $dateStr = $matches['Date'].Trim()
                     $rest    = $matches['Rest'].Trim()
-                    # Skip lines that have no amount-like token (be currency-agnostic)
-                    if ($rest -notmatch "[^\d\-+]*[-+]?\d[\d,]*\.\d{2}") { continue }
+                    $restCombined = $rest
+                    $consumed = 0
+                    $amountPattern = "[^\d\-+]*[-+]?\d[\d,]*\.\d{2}"
+                    if ($restCombined -notmatch $amountPattern) {
+                        $j = $i + 1
+                        while ($j -lt $txLines.Count) {
+                            $nextLine = $txLines[$j].Trim()
+                            if ([string]::IsNullOrWhiteSpace($nextLine)) {
+                                $j++
+                                $consumed++
+                                continue
+                            }
+                            if ($nextLine -match "^\d{1,2}\s+\w{3}\s+\d{2,4}") { break }
+                            $restCombined = ($restCombined + ' ' + $nextLine).Trim()
+                            $consumed++
+                            $j++
+                            if ($consumed -ge 3) { break }
+                        }
+                    }
+                    $j = $i + $consumed + 1
+                    if ($j -lt $txLines.Count) {
+                        $nextLine = $txLines[$j].Trim()
+                        if (-not [string]::IsNullOrWhiteSpace($nextLine) -and $nextLine -notmatch "^\d{1,2}\s+\w{3}\s+\d{2,4}") {
+                            if ($nextLine -match '(?i)\bFX\s*rate\b' -or $nextLine -match '\|' -or $nextLine -match '(?i)^\s*(purchase|transfer|payment|cash\s+withdrawal)') {
+                                $restCombined = ($restCombined + ' ' + $nextLine).Trim()
+                                $consumed++
+                            }
+                        }
+                    }
+                    if ($restCombined -notmatch $amountPattern) { continue }
                     # Flush previous
                     if ($currentTx) { $allTransactions += $currentTx }
                     $date = Get-ParsedDate $dateStr
+                    if ($consumed -gt 0) { $i += $consumed }
                     
+                    $restForAmounts = $rest
+                    if ($restForAmounts -notmatch $amountPattern) {
+                        $restForAmounts = $restCombined
+                    }
                     # Chase PDFs: Extract amounts by finding all currency values in the line
                     # Match amounts: +/- optional, currency symbol optional, digits with optional commas, decimal point, 2 digits
-                    $amounts = [regex]::Matches($rest, '[-+]?[\d,]+\.\d{2}') | ForEach-Object { $_.Value }
+                    $amounts = [regex]::Matches($restForAmounts, '[-+]?[\d,]+\.\d{2}') | ForEach-Object { $_.Value }
                     
                     # If no matches, try with currency symbol
                     if ($amounts.Count -eq 0) {
-                        $amounts = [regex]::Matches($rest, '[-+]?[\d,]+\.\d{2}') | ForEach-Object { $_.Value }
+                        $amounts = [regex]::Matches($restForAmounts, '[-+]?[\d,]+\.\d{2}') | ForEach-Object { $_.Value }
                     }
                     
                     $amountStr = $null
                     $balanceStr = $null
-                    $desc = $rest
+                    $fxAmountStr = $null
+                    $fxCurrency = $null
+                    $fxRate = $null
+                    $desc = if ([string]::IsNullOrWhiteSpace($rest)) { $restCombined } else { $rest }
+                    if ($restCombined -match '(?i)\bFX\s*rate\b') {
+                        $fxRateRaw = $null
+                        $restFx = $restCombined
+                        $euroSymbol = [char]::ConvertFromUtf32(0x20AC)
+                        $restFx = $restFx.Replace($euroSymbol, 'EUR ')
+                        $restFx = $restFx.Replace('$', 'USD ')
+                        if ($restFx -match '(?i)\bFX\s*rate\b.*?=\s*(?<FxCcy>[A-Z]{3})\s*(?<FxRate>[\d\.,]+)') {
+                            $fxCurrency = $matches['FxCcy']
+                            $fxRateRaw = $matches['FxRate']
+                        } elseif ($restFx -match '(?i)\bFX\s*rate\b.*?=\s*(?<FxRate>[\d\.,]+)\s*(?<FxCcy>[A-Z]{3})') {
+                            $fxCurrency = $matches['FxCcy']
+                            $fxRateRaw = $matches['FxRate']
+                        } elseif ($restFx -match '(?i)\bFX\s*rate\b.*?(?<FxCcy>[A-Z]{3})\s*(?<FxRate>[\d\.,]+)') {
+                            $fxCurrency = $matches['FxCcy']
+                            $fxRateRaw = $matches['FxRate']
+                        }
+                        if ($fxRateRaw) {
+                            $fxRateRaw = $fxRateRaw -replace '\s', ''
+                            if ($fxRateRaw -match ',' -and $fxRateRaw -notmatch '\.') {
+                                $fxRate = $fxRateRaw -replace ',', '.'
+                            } else {
+                                $fxRate = $fxRateRaw -replace ',', ''
+                            }
+                        }
+                    }
+                    if ($restCombined -match '\b(?<FxCcy>[A-Z]{3})\s*(?<FxAmt>[\d,]+\.\d{2})\b') {
+                        if (-not $fxCurrency -or $fxCurrency -eq 'GBP') { $fxCurrency = $matches['FxCcy'] }
+                        $fxAmountStr = $matches['FxAmt']
+                    }
+                    if ($fxAmountStr) {
+                        $filteredAmounts = New-Object System.Collections.Generic.List[string]
+                        $removed = $false
+                        foreach ($amt in $amounts) {
+                            if (-not $removed -and $amt -eq $fxAmountStr) {
+                                $removed = $true
+                                continue
+                            }
+                            $filteredAmounts.Add($amt)
+                        }
+                        $amounts = $filteredAmounts
+                    }
                     
                     if ($amounts.Count -ge 2) {
                         # Two or more amounts: second-to-last is transaction amount, last is balance
                         $balanceStr = $amounts[-1]
                         $amountStr  = $amounts[-2]
                         # Remove amounts from description using simple replace
-                        $desc = $rest
+                        $desc = $restCombined
                         foreach ($amt in $amounts) {
                             $desc = $desc -replace [regex]::Escape($amt) + '\s*'
                         }
                     } elseif ($amounts.Count -eq 1) {
                         # Single amount: could be balance only or transaction without balance
                         # Check if description suggests it's balance-only (Opening/Closing balance lines)
-                        if ($rest -match "(?i)(opening|closing)\s+balance") {
+                        if ($restCombined -match "(?i)(opening|closing)\s+balance") {
                             $balanceStr = $amounts[0]
                         } else {
                             $amountStr  = $amounts[0]
                         }
                         # Remove amount from description
                         if ($amounts.Count -gt 0) {
-                            $desc = $rest
+                            $desc = $restCombined
                             foreach ($amt in $amounts) {
                                 $desc = $desc -replace [regex]::Escape($amt) + '\s*'
                             }
                         }
                     }
                     
-                    $desc = $desc.Trim()
+                    if ($desc -match '^(?<Left>.+?)\s*\|') {
+                        $desc = $matches['Left']
+                    }
+                    $desc = $desc -replace '[^\x00-\x7F]', ''
+                    $desc = $desc -replace '[£$]', ''
+                    $desc = $desc -replace '[-+\s]+$', ''
+                    $desc = ($desc -replace '\s+', ' ').Trim()
+                    if ($desc -match '(?i)\b(opening|closing)\s+balance\b') {
+                        $currentTx = $null
+                        continue
+                    }
                     $amountGBP    = Convert-ToAmount $amountStr
                     $balanceAfter = Convert-ToAmount $balanceStr
+                    $amountFX     = Convert-ToAmount $fxAmountStr
+                    $fxRateValue  = $null
+                    if ($fxRate) {
+                        try { $fxRateValue = [decimal]::Parse($fxRate) } catch { $fxRateValue = $null }
+                    }
                     $txType       = Get-TransactionType -description $desc -amountGBP $amountGBP
                     # Force interest transactions to always be positive
                     if ($desc -match '(?i)interest' -and $amountGBP -lt 0) {
@@ -288,9 +381,9 @@ Get-ChildItem -Path $rootPath -Filter *.pdf -Recurse |
                         Date            = $date
                         Description     = $desc
                         AmountGBP       = $amountGBP
-                        AmountFX        = $null
-                        FXCurrency      = $null
-                        FXRate          = $null
+                        AmountFX        = $amountFX
+                        FXCurrency      = $fxCurrency
+                        FXRate          = $fxRateValue
                         BalanceAfter    = $balanceAfter
                         TransactionType = $txType
                         Category        = $null
@@ -468,36 +561,6 @@ if ($allTransactions.Count -eq 0) {
         Write-Host "Failed to export full transactions: $_" -ForegroundColor Red
     }
 }
-$monthlySummary = $allTransactions |
-    Group-Object BankName, AccountNumber, SortCode, AccountName, YearMonth |
-    ForEach-Object {
-        $group = $_.Group
-        $key   = $_.Name -split ',' | ForEach-Object { $_.Trim() }
-        [PSCustomObject]@{
-            BankName          = $key[0]
-            AccountNumber     = $key[1]
-            SortCode          = $key[2]
-            AccountName       = $key[3]
-            YearMonth         = $key[4]
-            TotalSpent        = ($group | Where-Object { $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalReceived     = ($group | Where-Object { $_.AmountGBP -gt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalFxSpent      = ($group | Where-Object { $_.AmountFX -ne $null -and $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalCashWithdraw = ($group | Where-Object { $_.TransactionType -eq "Cash Withdrawal" } | Measure-Object AmountGBP -Sum).Sum
-            TotalTransfersIn  = ($group | Where-Object { $_.TransactionType -eq "Transfer" -and $_.AmountGBP -gt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalTransfersOut = ($group | Where-Object { $_.TransactionType -eq "Transfer" -and $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            NetMovement       = ($group | Measure-Object AmountGBP -Sum).Sum
-        }
-    }
-try {
-    if ($monthlySummary -and $monthlySummary.Count -gt 0) {
-        $monthlySummary | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $outMonthlyCsv -Force
-    } else {
-        'BankName,AccountNumber,SortCode,AccountName,YearMonth,TotalSpent,TotalReceived,TotalFxSpent,TotalCashWithdraw,TotalTransfersIn,TotalTransfersOut,NetMovement' | Out-File -FilePath $outMonthlyCsv -Encoding UTF8
-    }
-    Write-Host "Monthly summary exported to: $outMonthlyCsv"
-} catch {
-    Write-Host "Failed to export monthly summary: $_" -ForegroundColor Red
-}
 $taxYearSummary = $allTransactions |
     Group-Object BankName, AccountNumber, SortCode, AccountName, TaxYear |
     ForEach-Object {
@@ -586,36 +649,6 @@ $lines += '---'
 $lines += 'Generated by BankStatementParser.ps1'
 $lines | Out-File -FilePath $outSummaryMd -Encoding UTF8
 Write-Host "Markdown summary written to: $outSummaryMd" -ForegroundColor Green
-$calendarSummary = $allTransactions |
-    Group-Object BankName, AccountNumber, SortCode, AccountName, CalendarYear |
-    ForEach-Object {
-        $group = $_.Group
-        $key   = $_.Name -split ',' | ForEach-Object { $_.Trim() }
-        [PSCustomObject]@{
-            BankName          = $key[0]
-            AccountNumber     = $key[1]
-            SortCode          = $key[2]
-            AccountName       = $key[3]
-            CalendarYear      = $key[4]
-            TotalSpent        = ($group | Where-Object { $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalReceived     = ($group | Where-Object { $_.AmountGBP -gt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalFxSpent      = ($group | Where-Object { $_.AmountFX -ne $null -and $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalCashWithdraw = ($group | Where-Object { $_.TransactionType -eq "Cash Withdrawal" } | Measure-Object AmountGBP -Sum).Sum
-            TotalTransfersIn  = ($group | Where-Object { $_.TransactionType -eq "Transfer" -and $_.AmountGBP -gt 0 } | Measure-Object AmountGBP -Sum).Sum
-            TotalTransfersOut = ($group | Where-Object { $_.TransactionType -eq "Transfer" -and $_.AmountGBP -lt 0 } | Measure-Object AmountGBP -Sum).Sum
-            NetMovement       = ($group | Measure-Object AmountGBP -Sum).Sum
-        }
-    }
-try {
-    if ($calendarSummary -and $calendarSummary.Count -gt 0) {
-        $calendarSummary | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $outCalendarYearCsv -Force
-    } else {
-        'BankName,AccountNumber,SortCode,AccountName,CalendarYear,TotalSpent,TotalReceived,TotalFxSpent,TotalCashWithdraw,TotalTransfersIn,TotalTransfersOut,NetMovement' | Out-File -FilePath $outCalendarYearCsv -Encoding UTF8
-    }
-    Write-Host "Calendar-year summary exported to: $outCalendarYearCsv"
-} catch {
-    Write-Host "Failed to export calendar-year summary: $_" -ForegroundColor Red
-}
 Write-Host ""
 Write-Host "Processed $processedCount PDFs. Skipped $($skippedPdfs.Count) PDFs." -ForegroundColor Cyan
 if ($skippedPdfs.Count -gt 0) {
