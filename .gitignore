@@ -1,0 +1,28 @@
+# Python environments
+project_wenv/
+.venv/
+venv/
+**/project_venv/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+.Python
+
+# EpsteIn local runtime files
+.epstein_api_key
+.epstein_cache.json
+EpsteIn/EpsteIn.html
+
+# PowerShell / editor temp files
+*.swp
+*.swo
+
+# Script-generated outputs
+_Scripts/ConditionalAccessPolicies.csv
+WindowsScripts/Bank_AllAccounts_*.csv
+WindowsScripts/Bank_Summary_*.csv
+WindowsScripts/Bank_Summary_Report_*.md
+
+# Safety: prevent nested repo metadata backups from being committed
+**/.git.backup_*/
