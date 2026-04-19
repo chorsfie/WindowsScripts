@@ -196,6 +196,23 @@ CSV_FIELDS = [
     "raw_row",
 ]
 
+PROCESSED_STATEMENT_FIELDS = [
+    "source_file",
+    "file_signature",
+    "last_processed_at",
+]
+
+YEARLY_SAVINGS_FIELDS = [
+    "tax_year",
+    "report_file",
+    "interest_total",
+    "non_taxable_savings",
+    "taxable_savings",
+    "estimated_income_total",
+    "estimated_income_band",
+    "generated_at",
+]
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 # pdfplumber : reads PDF files and extracts text and tables
 # requests   : makes HTTP calls to the LM Studio local server (localhost only)
@@ -590,6 +607,191 @@ def export_transactions_csv(transactions: list[dict], output_path: str) -> None:
             writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
 
 
+def load_transactions_csv(csv_path: str) -> list[dict]:
+    """Load previously normalized transaction rows from CSV if present."""
+    if not os.path.exists(csv_path):
+        return []
+
+    rows = []
+    with open(csv_path, "r", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            normalized = {field: row.get(field, "") for field in CSV_FIELDS}
+
+            for field in ("page_number", "row_index"):
+                value = normalized.get(field, "")
+                normalized[field] = int(value) if str(value).strip().isdigit() else ""
+
+            for field in ("debit", "credit", "amount_signed", "balance"):
+                value = str(normalized.get(field, "")).strip()
+                if value == "":
+                    normalized[field] = ""
+                    continue
+                try:
+                    normalized[field] = float(value)
+                except ValueError:
+                    normalized[field] = ""
+
+            rows.append(normalized)
+    return rows
+
+
+def dedupe_transaction_rows(rows: list[dict]) -> list[dict]:
+    """Dedupe normalized transaction rows by stable row signature."""
+    deduped = []
+    seen = set()
+    for row in rows:
+        signature = tuple(str(row.get(field, "")) for field in CSV_FIELDS)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(row)
+    return deduped
+
+
+def build_file_signature(path: Path) -> str:
+    """Create a lightweight fingerprint for processed-file reuse detection."""
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def load_processed_statement_index(csv_path: str) -> dict[str, str]:
+    """Load source_file -> file_signature mapping for processed statements."""
+    if not os.path.exists(csv_path):
+        return {}
+
+    index = {}
+    with open(csv_path, "r", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            source_file = str(row.get("source_file", "")).strip()
+            signature = str(row.get("file_signature", "")).strip()
+            if source_file and signature:
+                index[source_file] = signature
+    return index
+
+
+def save_processed_statement_index(csv_path: str, index: dict[str, str]) -> None:
+    """Persist processed statement signatures for next run reuse."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=PROCESSED_STATEMENT_FIELDS)
+        writer.writeheader()
+        for source_file in sorted(index.keys()):
+            writer.writerow({
+                "source_file": source_file,
+                "file_signature": index[source_file],
+                "last_processed_at": now,
+            })
+
+
+def summarize_taxable_savings(financial_data: dict, tax_year: str) -> dict:
+    """Estimate taxable vs non-taxable savings interest for a tax year."""
+    interest_total = round(
+        sum(float(item.get("amount", 0.0)) for item in financial_data.get("interest", []) if isinstance(item, dict)),
+        2,
+    )
+    income_total = round(
+        sum(float(item.get("amount", 0.0)) for item in financial_data.get("income", []) if isinstance(item, dict)),
+        2,
+    )
+
+    if income_total <= UK_TAX["basic_rate_limit"]:
+        savings_allowance = UK_TAX["savings_allowance_basic"]
+        band = "basic"
+    elif income_total <= UK_TAX["higher_rate_limit"]:
+        savings_allowance = UK_TAX["savings_allowance_higher"]
+        band = "higher"
+    else:
+        savings_allowance = 0
+        band = "additional"
+
+    non_taxable = round(min(interest_total, float(savings_allowance)), 2)
+    taxable = round(max(interest_total - non_taxable, 0.0), 2)
+
+    return {
+        "tax_year": tax_year,
+        "interest_total": interest_total,
+        "non_taxable_savings": non_taxable,
+        "taxable_savings": taxable,
+        "estimated_income_total": income_total,
+        "estimated_income_band": band,
+        "assumption": "Savings allowance estimated from extracted income events only.",
+    }
+
+
+def parse_savings_summary_from_report(report_path: str) -> dict | None:
+    """Read machine-readable savings summary metadata from a generated report."""
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+
+    match = re.search(r"<!--\s*SAVINGS_SUMMARY_JSON:\s*(\{.*?\})\s*-->", content)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(1))
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def tax_year_sort_key(tax_year: str) -> tuple[int, int]:
+    """Sort key helper for tax year labels."""
+    start, end = parse_tax_year(tax_year)
+    return (start, end)
+
+
+def build_rolling_savings_report(report_paths: list[str], rolling_report_path: str, summary_csv_path: str) -> None:
+    """Parse annual reports and generate rolling taxable/non-taxable savings table."""
+    summaries = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for report_path in report_paths:
+        summary = parse_savings_summary_from_report(report_path)
+        if not summary:
+            continue
+        summary["report_file"] = report_path
+        summary["generated_at"] = now
+        summaries.append(summary)
+
+    summaries.sort(key=lambda row: tax_year_sort_key(str(row.get("tax_year", "1900-01"))))
+
+    with open(summary_csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=YEARLY_SAVINGS_FIELDS)
+        writer.writeheader()
+        for row in summaries:
+            writer.writerow({key: row.get(key, "") for key in YEARLY_SAVINGS_FIELDS})
+
+    table_lines = [
+        "| Tax Year | Total Savings Interest | Non-Taxable Savings | Taxable Savings | Estimated Band |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    for row in summaries:
+        table_lines.append(
+            f"| {row.get('tax_year', '')} | £{float(row.get('interest_total', 0.0)):.2f} | "
+            f"£{float(row.get('non_taxable_savings', 0.0)):.2f} | "
+            f"£{float(row.get('taxable_savings', 0.0)):.2f} | {row.get('estimated_income_band', '')} |"
+        )
+
+    markdown = f"""# Rolling Savings Tax Report
+Generated: {now}
+
+This table is rebuilt by parsing yearly report files and reading each report's machine-readable savings summary.
+
+{os.linesep.join(table_lines)}
+
+## Notes
+- Figures are estimates based on extracted statement events.
+- Non-taxable/taxable split uses the Personal Savings Allowance estimate from each yearly report.
+"""
+
+    with open(rolling_report_path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+
+
 def append_unique_event(financial_data: dict, seen: dict, event_type: str, event: dict):
     """Add event if its dedupe signature has not been seen."""
     signature = event_signature(event_type, event)
@@ -962,7 +1164,14 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return text
 
 
-def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> tuple[dict[str, str], list[dict]]:
+def load_all_statements(
+    pdf_folder: str,
+    tax_year: str = "2024-25",
+    relevant_year_tokens: list[str] | None = None,
+    processed_index: dict[str, str] | None = None,
+    known_transaction_sources: set[str] | None = None,
+    allow_reuse: bool = False,
+) -> tuple[dict[str, str], list[dict], dict]:
     """
     Find, filter, deduplicate, and load all relevant PDF statements.
 
@@ -981,7 +1190,8 @@ def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> tuple[dic
         Returns:
             tuple:
                 - dict mapping relative file path (str) -> extracted text (str)
-                - list of normalized transaction rows for CSV export
+                - list of newly extracted normalized transaction rows for CSV export
+                - dict with loader metadata (counts, signatures, extracted sources)
     """
     folder = Path(pdf_folder)
 
@@ -1001,7 +1211,7 @@ def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> tuple[dic
         sys.exit(1)
 
     # Step 3 + 4: Filter to likely-relevant files for selected tax year
-    RELEVANT_YEARS = tax_year_filename_tokens(tax_year)
+    RELEVANT_YEARS = relevant_year_tokens or tax_year_filename_tokens(tax_year)
     SKIP_FOLDERS   = ["archive", "Archive"]    # Folder names to ignore entirely
 
     relevant_pdfs = []
@@ -1024,17 +1234,43 @@ def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> tuple[dic
     # Step 5: Extract text from each relevant PDF
     statements = {}
     normalized_rows = []
+    loader_meta = {
+        "reused_files": 0,
+        "extracted_files": 0,
+        "relevant_files": len(relevant_pdfs),
+        "file_signatures": {},
+        "extracted_sources": set(),
+    }
+
+    processed_index = processed_index or {}
+    known_transaction_sources = known_transaction_sources or set()
+
     for pdf_path in relevant_pdfs:
         try:
             rel_path = pdf_path.relative_to(folder)  # e.g. Lloyds\2024_April.pdf
         except ValueError:
             rel_path = pdf_path.name
-        text, rows = extract_text_and_transactions_from_pdf(str(pdf_path), str(rel_path))
-        if text.strip():                              # Only store files with readable text
-            statements[str(rel_path)] = text
-        normalized_rows.extend(rows)
 
-    return statements, normalized_rows
+        rel_path_str = str(rel_path)
+        signature = build_file_signature(pdf_path)
+        loader_meta["file_signatures"][rel_path_str] = signature
+
+        if (
+            allow_reuse
+            and processed_index.get(rel_path_str) == signature
+            and rel_path_str in known_transaction_sources
+        ):
+            loader_meta["reused_files"] += 1
+            continue
+
+        text, rows = extract_text_and_transactions_from_pdf(str(pdf_path), rel_path_str)
+        if text.strip():                              # Only store files with readable text
+            statements[rel_path_str] = text
+        normalized_rows.extend(rows)
+        loader_meta["extracted_files"] += 1
+        loader_meta["extracted_sources"].add(rel_path_str)
+
+    return statements, normalized_rows, loader_meta
 
 
 # ── LM Studio Connection ──────────────────────────────────────────────────────
@@ -1254,7 +1490,7 @@ def extract_financial_data(statements: dict[str, str], model: str) -> dict:
 
 # ── Tax Analysis ──────────────────────────────────────────────────────────────
 
-def calculate_tax_implications(financial_data: dict, model: str, tax_year: str = "2024-25") -> str:
+def calculate_tax_implications(financial_data: dict, model: str, tax_year: str = "2024-25", use_llm: bool = True) -> str:
     """
     Send the merged financial data and UK tax thresholds to the AI for analysis.
 
@@ -1267,6 +1503,21 @@ def calculate_tax_implications(financial_data: dict, model: str, tax_year: str =
     text which is embedded directly into the final report file.
     """
     print("\nStep 2: Calculating UK tax implications...")
+
+    if not use_llm:
+        savings = summarize_taxable_savings(financial_data, tax_year)
+        return (
+            f"## Deterministic Summary ({tax_year})\n\n"
+            f"This summary was generated without an LLM to avoid context-window failures.\n\n"
+            f"- Total extracted income events: £{sum(float(i.get('amount', 0.0)) for i in financial_data.get('income', []) if isinstance(i, dict)):.2f}\n"
+            f"- Total extracted savings interest: £{savings['interest_total']:.2f}\n"
+            f"- Non-taxable savings (estimated): £{savings['non_taxable_savings']:.2f}\n"
+            f"- Taxable savings (estimated): £{savings['taxable_savings']:.2f}\n"
+            f"- Estimated income band used: {savings['estimated_income_band']}\n\n"
+            "Assumptions:\n"
+            "- Personal Savings Allowance estimated from extracted income events only.\n"
+            "- Classification is a practical estimate, not filing advice.\n"
+        )
 
     prompt = build_analysis_prompt(financial_data, tax_year, condensed=False)
     analysis = ask_llm(ANALYSIS_SYSTEM, prompt, model)
@@ -1282,7 +1533,14 @@ def calculate_tax_implications(financial_data: dict, model: str, tax_year: str =
 
 # ── Report Generation ─────────────────────────────────────────────────────────
 
-def generate_report(financial_data: dict, tax_analysis: str, output_path: str, tax_year: str = "2024-25", filter_stats: dict | None = None):
+def generate_report(
+    financial_data: dict,
+    tax_analysis: str,
+    output_path: str,
+    tax_year: str = "2024-25",
+    filter_stats: dict | None = None,
+    savings_summary: dict | None = None,
+):
     """
     Write the complete tax report to a Markdown (.md) file.
 
@@ -1341,6 +1599,16 @@ incorrectly classified, the tax analysis below will also be affected.
 
 {date_filter_section}
 
+## Savings Classification Summary
+Estimated split for savings interest in tax year {tax_year}:
+
+- Total savings interest: £{float((savings_summary or {}).get('interest_total', 0.0)):.2f}
+- Non-taxable savings (estimated): £{float((savings_summary or {}).get('non_taxable_savings', 0.0)):.2f}
+- Taxable savings (estimated): £{float((savings_summary or {}).get('taxable_savings', 0.0)):.2f}
+- Estimated income band used: {(savings_summary or {}).get('estimated_income_band', 'unknown')}
+
+<!-- SAVINGS_SUMMARY_JSON: {json.dumps(savings_summary or {}, ensure_ascii=False)} -->
+
 ---
 
 ## Tax Analysis and Implications
@@ -1365,6 +1633,16 @@ incorrectly classified, the tax analysis below will also be affected.
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\n  Report saved to: {output_path}")
+
+
+def build_year_output_path(base_output: str, tax_year: str, multi_year_mode: bool) -> str:
+    """Create per-year output filename when generating multiple yearly reports."""
+    if not multi_year_mode:
+        return base_output
+    stem, ext = os.path.splitext(base_output)
+    suffix = tax_year.replace("-", "_")
+    ext = ext or ".md"
+    return f"{stem}_{suffix}{ext}"
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -1418,77 +1696,177 @@ def main():
         default="2024-25",
         help="Tax year label for filtering/reporting in format YYYY-YY (default: 2024-25)"
     )
+    parser.add_argument(
+        "--tax-years",
+        default="",
+        help="Comma-separated tax years to process in one run (e.g. 2023-24,2024-25,2025-26)"
+    )
+    parser.add_argument(
+        "--processed-statements-csv",
+        default="processed_statements.csv",
+        help="CSV registry of processed statement signatures (default: processed_statements.csv)"
+    )
+    parser.add_argument(
+        "--rolling-report",
+        default="rolling_tax_savings_report.md",
+        help="Rolling markdown report path built from yearly outputs (default: rolling_tax_savings_report.md)"
+    )
+    parser.add_argument(
+        "--yearly-summary-csv",
+        default="yearly_savings_summary.csv",
+        help="CSV path for rolling yearly savings totals (default: yearly_savings_summary.csv)"
+    )
+    parser.add_argument(
+        "--no-track-processed",
+        action="store_true",
+        help="Disable processed statement tracking and always re-parse all PDFs"
+    )
     args = parser.parse_args()
 
-    try:
-        start_year, end_year = parse_tax_year(args.tax_year)
-        normalized_tax_year = f"{start_year}-{str(end_year)[-2:]}"
-    except ValueError as exc:
-        print(f"\n  Invalid --tax-year value '{args.tax_year}': {exc}")
-        sys.exit(1)
+    requested_tax_years = []
+    if args.tax_years.strip():
+        requested_tax_years = [token.strip() for token in args.tax_years.split(",") if token.strip()]
+    else:
+        requested_tax_years = [args.tax_year]
+
+    normalized_tax_years = []
+    for tax_year in requested_tax_years:
+        try:
+            start_year, end_year = parse_tax_year(tax_year)
+            normalized_tax_years.append(f"{start_year}-{str(end_year)[-2:]}")
+        except ValueError as exc:
+            print(f"\n  Invalid tax year '{tax_year}': {exc}")
+            sys.exit(1)
+
+    normalized_tax_years = sorted(set(normalized_tax_years), key=tax_year_sort_key)
+    primary_tax_year = normalized_tax_years[0]
+    multi_year_mode = len(normalized_tax_years) > 1
+    track_processed = not args.no_track_processed
 
     print("=" * 60)
     print("  UK Tax Analysis Agent - Local and Private")
     print("=" * 60)
     print(f"  Backend : LM Studio (localhost:1234)")
     print(f"  Model   : {args.model}")
-    print(f"  Tax year: {tax_year_label(start_year, end_year)}")
+    print(f"  Tax year: {', '.join(normalized_tax_years)}")
     print(f"  Folder  : {args.pdf_folder}")
     print(f"  CSV     : {args.transactions_csv}")
+    print(f"  Processed registry: {args.processed_statements_csv}")
     print(f"  Output  : {args.output}")
 
-    # Confirm LM Studio is reachable before doing any work
-    print("\n  Checking LM Studio connection...")
-    if not check_lm_studio():
-        print("\n  LM Studio server is not running!")
-        print("  Fix: Open LM Studio -> Developer tab -> Start Server")
-        sys.exit(1)
-    print("  LM Studio is running.")
+    # Confirm LM Studio only when LLM extraction or analysis is required.
+    if args.skip_llm_extraction:
+        print("\n  LLM extraction disabled; using deterministic CSV mode.")
+    else:
+        print("\n  Checking LM Studio connection...")
+        if not check_lm_studio():
+            print("\n  LM Studio server is not running!")
+            print("  Fix: Open LM Studio -> Developer tab -> Start Server")
+            sys.exit(1)
+        print("  LM Studio is running.")
 
-    # Load and filter PDFs from the statements folder
-    statements, normalized_rows = load_all_statements(args.pdf_folder, tax_year=normalized_tax_year)
-    print(f"  Loaded {len(statements)} statement(s) with readable text.")
+    discovery_tax_year = primary_tax_year
+    discovery_year_tokens = sorted({
+        token
+        for year in normalized_tax_years
+        for token in tax_year_filename_tokens(year)
+    })
 
-    # Persist normalized rows for deterministic auditability and downstream processing
-    export_transactions_csv(normalized_rows, args.transactions_csv)
-    print(f"  Exported {len(normalized_rows)} normalized row(s) to {args.transactions_csv}.")
+    existing_rows = []
+    existing_sources = set()
+    processed_index = {}
 
-    # Extract structured financial events from statements (LLM) or CSV rows (deterministic)
+    if track_processed:
+        processed_index = load_processed_statement_index(args.processed_statements_csv)
+    if track_processed and args.skip_llm_extraction:
+        existing_rows = load_transactions_csv(args.transactions_csv)
+        existing_sources = {str(row.get("source_file", "")).strip() for row in existing_rows if row.get("source_file")}
+
+    statements, new_rows, loader_meta = load_all_statements(
+        args.pdf_folder,
+        tax_year=discovery_tax_year,
+        relevant_year_tokens=discovery_year_tokens,
+        processed_index=processed_index,
+        known_transaction_sources=existing_sources,
+        allow_reuse=(track_processed and args.skip_llm_extraction),
+    )
+
+    print(
+        f"  Statement scan: {loader_meta['relevant_files']} relevant, "
+        f"{loader_meta['extracted_files']} extracted, {loader_meta['reused_files']} reused from CSV cache."
+    )
+    print(f"  Loaded {len(statements)} statement(s) with readable text this run.")
+
+    # Persist normalized rows, reusing prior rows where possible in deterministic mode.
+    if track_processed and args.skip_llm_extraction:
+        refreshed_sources = loader_meta["extracted_sources"]
+        kept_existing_rows = [
+            row for row in existing_rows
+            if str(row.get("source_file", "")).strip() not in refreshed_sources
+        ]
+        combined_rows = dedupe_transaction_rows(kept_existing_rows + new_rows)
+    else:
+        combined_rows = dedupe_transaction_rows(new_rows)
+
+    export_transactions_csv(combined_rows, args.transactions_csv)
+    print(f"  Exported {len(combined_rows)} normalized row(s) to {args.transactions_csv}.")
+
+    # Update processed statements registry.
+    if track_processed:
+        updated_index = dict(processed_index)
+        updated_index.update(loader_meta["file_signatures"])
+        save_processed_statement_index(args.processed_statements_csv, updated_index)
+        print(f"  Updated processed statement registry: {args.processed_statements_csv}")
+
+    # Extract structured financial events once, then filter by year for report generation.
     if args.skip_llm_extraction:
         print("\nStep 1: Building financial data from normalized CSV rows (LLM extraction skipped)...")
-        financial_data = extract_financial_data_from_transactions(normalized_rows)
-        extracted_count = sum(len(financial_data[k]) for k in EXTRACTION_LIST_KEYS)
+        base_financial_data = extract_financial_data_from_transactions(combined_rows)
+        extracted_count = sum(len(base_financial_data[k]) for k in EXTRACTION_LIST_KEYS)
         print(f"  Deterministic extraction produced {extracted_count} financial event(s).")
     else:
-        financial_data = extract_financial_data(statements, args.model)
+        base_financial_data = extract_financial_data(statements, args.model)
 
-    # Apply strict transaction-date filtering for the selected UK tax year
-    financial_data, date_filter_stats = filter_financial_data_by_tax_year(financial_data, normalized_tax_year)
-    print(
-        "  Date filter "
-        f"({date_filter_stats['window_start']} to {date_filter_stats['window_end']}): "
-        f"kept {date_filter_stats['kept_events']}/{date_filter_stats['total_events']} events "
-        f"({date_filter_stats['excluded_outside_year']} outside year, "
-        f"{date_filter_stats['excluded_invalid_date']} invalid date)."
-    )
+    generated_reports = []
+    for tax_year in normalized_tax_years:
+        print(f"\nStep 2: Generating report for tax year {tax_year}...")
+        financial_data, date_filter_stats = filter_financial_data_by_tax_year(base_financial_data, tax_year)
+        print(
+            "  Date filter "
+            f"({date_filter_stats['window_start']} to {date_filter_stats['window_end']}): "
+            f"kept {date_filter_stats['kept_events']}/{date_filter_stats['total_events']} events "
+            f"({date_filter_stats['excluded_outside_year']} outside year, "
+            f"{date_filter_stats['excluded_invalid_date']} invalid date)."
+        )
 
-    # Run UK tax analysis against tax-year-filtered data
-    tax_analysis = calculate_tax_implications(financial_data, args.model, tax_year=normalized_tax_year)
+        tax_analysis = calculate_tax_implications(
+            financial_data,
+            args.model,
+            tax_year=tax_year,
+            use_llm=not args.skip_llm_extraction,
+        )
+        savings_summary = summarize_taxable_savings(financial_data, tax_year)
 
-    # Write the full report to disk
-    generate_report(
-        financial_data,
-        tax_analysis,
-        args.output,
-        tax_year=normalized_tax_year,
-        filter_stats=date_filter_stats,
-    )
+        year_output = build_year_output_path(args.output, tax_year, multi_year_mode)
+        generate_report(
+            financial_data,
+            tax_analysis,
+            year_output,
+            tax_year=tax_year,
+            filter_stats=date_filter_stats,
+            savings_summary=savings_summary,
+        )
+        generated_reports.append(year_output)
 
-    # Also print the analysis to the terminal for a quick read
-    print("\n" + "=" * 60)
-    print("  TAX ANALYSIS SUMMARY")
-    print("=" * 60)
-    print(tax_analysis)
+        print("\n" + "=" * 60)
+        print(f"  TAX ANALYSIS SUMMARY ({tax_year})")
+        print("=" * 60)
+        print(tax_analysis)
+
+    build_rolling_savings_report(generated_reports, args.rolling_report, args.yearly_summary_csv)
+    print(f"\n  Rolling report saved to: {args.rolling_report}")
+    print(f"  Yearly summary CSV saved to: {args.yearly_summary_csv}")
+
     print("\n" + "=" * 60)
     print("  Done. Always verify with a qualified UK tax professional.")
     print("=" * 60)

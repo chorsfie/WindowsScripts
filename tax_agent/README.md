@@ -86,11 +86,22 @@ python tax_agent.py ./my_statements --model phi4-mini
 # Save report with a custom name
 python tax_agent.py ./statements --output 2024_tax_report.md
 
+# Generate multiple tax years in one run with rolling summary outputs
+python tax_agent.py "G:\\My Drive\\Statements" \
+  --tax-years 2023-24,2024-25,2025-26 \
+  --skip-llm-extraction \
+  --output tax_report.md \
+  --rolling-report rolling_tax_savings_report.md \
+  --yearly-summary-csv yearly_savings_summary.csv
+
 # Export normalized statement rows to CSV
 python tax_agent.py ./statements --transactions-csv normalized_transactions.csv
 
 # Skip LLM extraction stage and build events from CSV rows deterministically
 python tax_agent.py ./statements --skip-llm-extraction --output tax_report_fast.md
+
+# Processed statement tracking (default on) avoids re-parsing unchanged PDFs
+python tax_agent.py ./statements --processed-statements-csv processed_statements.csv
 ```
 
 ---
@@ -113,11 +124,14 @@ For the most complete analysis, include PDFs from:
 The agent produces:
 1. **Terminal output** — analysis printed immediately
 2. **`normalized_transactions.csv`** — normalized rows extracted from PDF tables
-3. **`tax_report.md`** — full report saved to disk, including:
+3. **`processed_statements.csv`** — statement signature registry for incremental re-runs
+4. **`tax_report.md`** (or yearly variants) — full report saved to disk, including:
    - Raw extracted financial data (JSON)
    - Full tax analysis with estimated liabilities
    - Self Assessment guidance
    - Next steps
+5. **`rolling_tax_savings_report.md`** — rolling table of taxable vs non-taxable savings by year
+6. **`yearly_savings_summary.csv`** — machine-readable yearly savings totals
 
 ---
 

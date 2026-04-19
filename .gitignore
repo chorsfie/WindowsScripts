@@ -24,6 +24,10 @@ WindowsScripts/Bank_AllAccounts_*.csv
 WindowsScripts/Bank_Summary_*.csv
 WindowsScripts/Bank_Summary_Report_*.md
 tax_agent/normalized_transactions.csv
+tax_agent/processed_statements.csv
+tax_agent/yearly_savings_summary.csv
+tax_agent/rolling_tax_savings_report.md
+tax_agent/tax_report_*.md
 tax_agent/tax_report_csv_mode.md
 tax_agent/tax_report_test.md
 tax_report.md
