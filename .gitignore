@@ -23,6 +23,10 @@ _Scripts/ConditionalAccessPolicies.csv
 WindowsScripts/Bank_AllAccounts_*.csv
 WindowsScripts/Bank_Summary_*.csv
 WindowsScripts/Bank_Summary_Report_*.md
+tax_agent/normalized_transactions.csv
+tax_agent/tax_report_csv_mode.md
+tax_agent/tax_report_test.md
+tax_report.md
 
 # Safety: prevent nested repo metadata backups from being committed
 **/.git.backup_*/

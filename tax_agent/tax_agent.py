@@ -128,6 +128,7 @@ import os
 import sys
 import json
 import re
+import csv
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -170,6 +171,30 @@ EXTRACTION_SCHEMA = {
 }
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+AMOUNT_RE = re.compile(r"(?<!\d)(-?\d{1,3}(?:,\d{3})*(?:\.\d{2}))(?!\d)")
+DATE_IN_LINE_RE = re.compile(
+    r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+    re.IGNORECASE,
+)
+
+DATE_PARSE_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+    "%d %b %Y", "%d %B %Y", "%d %b %y", "%d %B %y",
+]
+
+CSV_FIELDS = [
+    "source_file",
+    "page_number",
+    "row_index",
+    "date_raw",
+    "date_iso",
+    "description",
+    "debit",
+    "credit",
+    "amount_signed",
+    "balance",
+    "raw_row",
+]
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 # pdfplumber : reads PDF files and extracts text and tables
@@ -291,6 +316,416 @@ def parse_iso_date(value: str):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
+def clean_cell(value) -> str:
+    """Normalize PDF table cell text to a compact string."""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def normalize_description_text(text: str) -> str:
+    """Clean OCR noise and repeated column-label artefacts from descriptions."""
+    if not isinstance(text, str):
+        return ""
+
+    normalized = text
+    normalized = re.sub(r"\bD0ate\b|\bDate\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\b[A-Z]?Description\b|\b[A-Z]?escription\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\b[A-Z]?Type\b|\b[A-Z]?ype\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bMoney\s*In\b.*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .|:-")
+    return normalized
+
+
+def parse_amount(value: str) -> float | None:
+    """Parse currency-like strings to float; return None if not numeric."""
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    if not cleaned or cleaned in {"-", "--", "—"}:
+        return None
+
+    upper = cleaned.upper()
+    negative = False
+    if upper.startswith("(") and upper.endswith(")"):
+        negative = True
+        upper = upper[1:-1].strip()
+    if upper.endswith("DR"):
+        negative = True
+        upper = upper[:-2].strip()
+    if upper.endswith("CR"):
+        upper = upper[:-2].strip()
+
+    upper = upper.replace("£", "").replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", upper)
+    if not match:
+        return None
+
+    amount = float(match.group(0))
+    if negative and amount > 0:
+        amount = -amount
+    return amount
+
+
+def infer_year_from_filename(filename: str) -> int | None:
+    """Infer a 4-digit year from a statement filename."""
+    match = re.search(r"(20\d{2})", filename)
+    return int(match.group(1)) if match else None
+
+
+def normalize_date(raw_value: str, fallback_year: int | None = None) -> str:
+    """Parse common bank-statement date formats into ISO YYYY-MM-DD."""
+    if not raw_value:
+        return ""
+
+    candidate = raw_value.strip()
+    candidate = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s+", " ", candidate)
+
+    date_like = re.search(r"\d{1,4}[\-/\. ]\w{1,3}[\-/\. ]\d{2,4}|\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}", candidate)
+    if date_like:
+        candidate = date_like.group(0)
+
+    for fmt in DATE_PARSE_FORMATS:
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    if fallback_year is not None:
+        for fmt in ("%d %b", "%d %B"):
+            try:
+                parsed = datetime.strptime(f"{candidate} {fallback_year}", f"{fmt} %Y")
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+    return ""
+
+
+def normalize_transaction_row(cells: list[str], source_file: str, page_number: int, row_index: int) -> dict:
+    """Convert a raw PDF table row into a normalized transaction-like record."""
+    fallback_year = infer_year_from_filename(Path(source_file).name)
+    parsed_amounts = [(idx, parse_amount(cell)) for idx, cell in enumerate(cells)]
+    parsed_amounts = [(idx, amount) for idx, amount in parsed_amounts if amount is not None]
+
+    date_raw = ""
+    date_iso = ""
+    date_index = None
+    for idx, cell in enumerate(cells):
+        normalized = normalize_date(cell, fallback_year=fallback_year)
+        if normalized:
+            date_raw = cell
+            date_iso = normalized
+            date_index = idx
+            break
+
+    debit = credit = balance = None
+    if len(parsed_amounts) >= 3:
+        debit = parsed_amounts[-3][1]
+        credit = parsed_amounts[-2][1]
+        balance = parsed_amounts[-1][1]
+    elif len(parsed_amounts) == 2:
+        debit = parsed_amounts[0][1]
+        credit = parsed_amounts[1][1]
+    elif len(parsed_amounts) == 1:
+        credit = parsed_amounts[0][1]
+
+    amount_signed = None
+    if credit is not None and debit is not None:
+        amount_signed = round(float(credit) - abs(float(debit)), 2)
+    elif credit is not None:
+        amount_signed = round(float(credit), 2)
+    elif debit is not None:
+        amount_signed = round(-abs(float(debit)), 2)
+
+    amount_indexes = {idx for idx, _ in parsed_amounts}
+    description_parts = [
+        cell for idx, cell in enumerate(cells)
+        if idx != date_index and idx not in amount_indexes and cell
+    ]
+    description = normalize_description_text(" ".join(description_parts).strip())
+    if not description:
+        description = normalize_description_text(" ".join(cell for cell in cells if cell).strip())
+
+    return {
+        "source_file": source_file,
+        "page_number": page_number,
+        "row_index": row_index,
+        "date_raw": date_raw,
+        "date_iso": date_iso,
+        "description": description,
+        "debit": "" if debit is None else round(float(debit), 2),
+        "credit": "" if credit is None else round(float(credit), 2),
+        "amount_signed": "" if amount_signed is None else amount_signed,
+        "balance": "" if balance is None else round(float(balance), 2),
+        "raw_row": " | ".join(cells),
+    }
+
+
+def parse_transactions_from_text(page_text: str, source_file: str, page_number: int) -> list[dict]:
+    """Parse transaction-like rows from OCR/plain text lines when table extraction is weak."""
+    fallback_year = infer_year_from_filename(Path(source_file).name)
+    parsed_rows = []
+
+    for line_index, raw_line in enumerate(page_text.splitlines(), 1):
+        line = clean_cell(raw_line)
+        if len(line) < 12:
+            continue
+
+        line_lower = line.lower()
+        if "column" in line_lower or "your transactions" in line_lower:
+            continue
+        if "opening balance" in line_lower or "closing balance" in line_lower:
+            continue
+        if "balance on" in line_lower and ("money in" in line_lower or "money out" in line_lower):
+            continue
+
+        date_match = DATE_IN_LINE_RE.search(line)
+        if not date_match:
+            continue
+        date_raw = date_match.group(1)
+        date_iso = normalize_date(date_raw, fallback_year=fallback_year)
+        if not date_iso:
+            continue
+
+        amounts = [parse_amount(match.group(1)) for match in AMOUNT_RE.finditer(line)]
+        amounts = [amount for amount in amounts if amount is not None]
+        if not amounts:
+            continue
+
+        debit = credit = balance = None
+        has_money_out = "money out" in line_lower or "debit" in line_lower
+        has_money_in = "money in" in line_lower or "credit" in line_lower
+        has_balance = "balance" in line_lower
+
+        if has_balance and len(amounts) >= 2:
+            balance = amounts[-1]
+            txn_amount = amounts[-2] if len(amounts) > 2 else amounts[0]
+            if has_money_out and not has_money_in:
+                debit = abs(txn_amount)
+            elif has_money_in and not has_money_out:
+                credit = abs(txn_amount)
+            elif txn_amount < 0:
+                debit = abs(txn_amount)
+            else:
+                credit = abs(txn_amount)
+        elif len(amounts) >= 1:
+            txn_amount = amounts[0]
+            if has_money_out or txn_amount < 0:
+                debit = abs(txn_amount)
+            else:
+                credit = abs(txn_amount)
+
+        amount_signed = None
+        if credit is not None and debit is not None:
+            amount_signed = round(float(credit) - abs(float(debit)), 2)
+        elif credit is not None:
+            amount_signed = round(float(credit), 2)
+        elif debit is not None:
+            amount_signed = round(-abs(float(debit)), 2)
+
+        description_raw = line.replace(date_raw, " ", 1)
+        description = normalize_description_text(description_raw)
+        if not description:
+            description = line
+
+        parsed_rows.append({
+            "source_file": source_file,
+            "page_number": page_number,
+            "row_index": 10_000 + line_index,
+            "date_raw": date_raw,
+            "date_iso": date_iso,
+            "description": description,
+            "debit": "" if debit is None else round(float(debit), 2),
+            "credit": "" if credit is None else round(float(credit), 2),
+            "amount_signed": "" if amount_signed is None else amount_signed,
+            "balance": "" if balance is None else round(float(balance), 2),
+            "raw_row": line,
+        })
+
+    return parsed_rows
+
+
+def extract_text_and_transactions_from_pdf(pdf_path: str, source_file: str) -> tuple[str, list[dict]]:
+    """Extract text plus normalized table rows from one PDF statement."""
+    text_parts = []
+    transactions = []
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            print(f"  Reading {Path(pdf_path).name}: {len(pdf.pages)} page(s)")
+            for page_index, page in enumerate(pdf.pages, 1):
+                tables = page.extract_tables()
+                if tables:
+                    for table in tables:
+                        for row_index, row in enumerate(table, 1):
+                            clean_row = [clean_cell(cell) for cell in row] if row else []
+                            if not any(clean_row):
+                                continue
+                            text_parts.append(" | ".join(clean_row))
+                            normalized = normalize_transaction_row(clean_row, source_file, page_index, row_index)
+                            if normalized["date_iso"] or normalized["amount_signed"] != "":
+                                transactions.append(normalized)
+
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+                    transactions.extend(parse_transactions_from_text(text, source_file, page_index))
+    except Exception as e:
+        print(f"  Warning: Could not read {pdf_path}: {e}")
+        return "", []
+
+    return "\n".join(text_parts), transactions
+
+
+def export_transactions_csv(transactions: list[dict], output_path: str) -> None:
+    """Write normalized transaction rows to CSV for deterministic downstream parsing."""
+    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for row in transactions:
+            writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+
+def append_unique_event(financial_data: dict, seen: dict, event_type: str, event: dict):
+    """Add event if its dedupe signature has not been seen."""
+    signature = event_signature(event_type, event)
+    if signature in seen[event_type]:
+        return
+    seen[event_type].add(signature)
+    financial_data[event_type].append(event)
+
+
+def extract_financial_data_from_transactions(transactions: list[dict]) -> dict:
+    """Build financial event JSON deterministically from normalized transaction rows."""
+    financial_data = {k: [] for k in EXTRACTION_LIST_KEYS}
+    financial_data["notes"] = "Deterministic extraction from normalized CSV rows (LLM extraction skipped)."
+    seen = {k: set() for k in EXTRACTION_LIST_KEYS}
+
+    salary_keywords = ("salary", "payroll", "wages", "paye")
+    freelance_keywords = ("freelance", "invoice", "consulting", "contractor", "client")
+    rental_keywords = ("rent", "tenant", "rental")
+    dividend_keywords = ("dividend", "div ", "drip")
+    pension_keywords = ("pension", "sipp", "avc", "nest")
+    isa_keywords = ("isa", "cash isa", "stocks", "lisa", "ifisa")
+    incoming_keywords = (
+        "bacs credit", "bank giro", "faster payment in", "payment in", "received", "refund", "credit",
+        "from ", "transfer in", "interest",
+    )
+    outgoing_keywords = (
+        "money out", "direct debit", "standing order", "card", "purchase", "payment to", "transfer to", "to ",
+        "withdrawal", "atm", "cash",
+    )
+    summary_keywords = (
+        "opening balance", "closing balance", "balance on", "money in", "money out", "summary",
+    )
+
+    for row in transactions:
+        date = row.get("date_iso", "")
+        if not is_iso_date(date):
+            continue
+
+        description = str(row.get("description", "")).strip()
+        description_lower = description.lower()
+
+        if any(keyword in description_lower for keyword in summary_keywords):
+            continue
+
+        credit = row.get("credit")
+        debit = row.get("debit")
+        amount_signed = row.get("amount_signed")
+
+        credit_value = float(credit) if isinstance(credit, (int, float)) else None
+        debit_value = abs(float(debit)) if isinstance(debit, (int, float)) else None
+        signed_value = float(amount_signed) if isinstance(amount_signed, (int, float)) else None
+
+        inflow_amount = credit_value if credit_value is not None else (signed_value if signed_value and signed_value > 0 else None)
+        outflow_amount = debit_value if debit_value is not None else (abs(signed_value) if signed_value and signed_value < 0 else None)
+
+        if inflow_amount and "interest" in description_lower:
+            append_unique_event(financial_data, seen, "interest", {
+                "date": date,
+                "bank": Path(str(row.get("source_file", ""))).stem,
+                "amount": round(inflow_amount, 2),
+                "account_type": "savings" if "savings" in description_lower else "other",
+            })
+            continue
+
+        if inflow_amount and any(keyword in description_lower for keyword in dividend_keywords):
+            append_unique_event(financial_data, seen, "dividends", {
+                "date": date,
+                "company": description[:120],
+                "amount": round(inflow_amount, 2),
+                "is_isa": "isa" in description_lower,
+            })
+            continue
+
+        if outflow_amount and any(keyword in description_lower for keyword in pension_keywords):
+            append_unique_event(financial_data, seen, "pension_contributions", {
+                "date": date,
+                "amount": round(outflow_amount, 2),
+                "type": "personal",
+            })
+            continue
+
+        if outflow_amount and any(keyword in description_lower for keyword in isa_keywords):
+            isa_type = "cash"
+            if "lisa" in description_lower:
+                isa_type = "LISA"
+            elif "stocks" in description_lower:
+                isa_type = "stocks"
+            elif "ifisa" in description_lower:
+                isa_type = "IFISA"
+
+            append_unique_event(financial_data, seen, "isa_deposits", {
+                "date": date,
+                "amount": round(outflow_amount, 2),
+                "isa_type": isa_type,
+            })
+            continue
+
+        if inflow_amount and inflow_amount > 0:
+            income_type = None
+            if any(keyword in description_lower for keyword in salary_keywords):
+                income_type = "salary"
+            elif any(keyword in description_lower for keyword in freelance_keywords):
+                income_type = "freelance"
+            elif any(keyword in description_lower for keyword in rental_keywords):
+                income_type = "rental"
+            elif (
+                inflow_amount >= 250
+                and any(keyword in description_lower for keyword in incoming_keywords)
+                and not any(keyword in description_lower for keyword in outgoing_keywords)
+            ):
+                income_type = "other"
+
+            if income_type:
+                append_unique_event(financial_data, seen, "income", {
+                    "date": date,
+                    "description": description[:180],
+                    "amount": round(inflow_amount, 2),
+                    "type": income_type,
+                })
+                continue
+
+        if (
+            inflow_amount
+            and inflow_amount >= 1000
+            and not any(keyword in description_lower for keyword in outgoing_keywords)
+            and not any(keyword in description_lower for keyword in summary_keywords)
+        ):
+            append_unique_event(financial_data, seen, "large_unexplained_credits", {
+                "date": date,
+                "amount": round(inflow_amount, 2),
+                "description": description[:180],
+            })
+
+    return financial_data
+
+
 def filter_financial_data_by_tax_year(financial_data: dict, tax_year: str) -> tuple[dict, dict]:
     """Keep only events whose transaction dates fall inside the selected UK tax year."""
     start_date, end_date = tax_year_date_window(tax_year)
@@ -337,6 +772,62 @@ def filter_financial_data_by_tax_year(financial_data: dict, tax_year: str) -> tu
         "excluded_invalid_date": excluded_invalid_date,
     }
     return filtered, stats
+
+
+def build_condensed_analysis_data(financial_data: dict, max_items_per_type: int = 25) -> dict:
+    """Condense extracted data for analysis prompts when context is too large."""
+    condensed = {"notes": financial_data.get("notes", "")}
+    summary = {"counts": {}, "totals": {}, "truncated": {}}
+
+    for key in EXTRACTION_LIST_KEYS:
+        records = financial_data.get(key, [])
+        if not isinstance(records, list):
+            records = []
+
+        summary["counts"][key] = len(records)
+        if len(records) > max_items_per_type:
+            summary["truncated"][key] = len(records) - max_items_per_type
+        condensed[key] = records[:max_items_per_type]
+
+        if key in {"income", "interest", "dividends", "pension_contributions", "isa_deposits", "large_unexplained_credits"}:
+            summary["totals"][key] = round(sum(float(r.get("amount", 0.0)) for r in records if isinstance(r, dict)), 2)
+        elif key == "capital_gains":
+            summary["totals"]["capital_gains_gain"] = round(sum(float(r.get("gain", 0.0)) for r in records if isinstance(r, dict)), 2)
+            summary["totals"]["capital_gains_proceeds"] = round(sum(float(r.get("proceeds", 0.0)) for r in records if isinstance(r, dict)), 2)
+
+    condensed["summary"] = summary
+    return condensed
+
+
+def build_analysis_prompt(financial_data: dict, tax_year: str, condensed: bool = False) -> str:
+    """Create analysis prompt text for normal or condensed datasets."""
+    tax_context = json.dumps(UK_TAX, separators=(",", ":"))
+    data_str = json.dumps(financial_data, separators=(",", ":"), ensure_ascii=False)
+    condensed_note = "\nNOTE: Dataset was condensed due to model context limits; use summary totals and counts for calculations."
+
+    return f"""Using the extracted financial data and UK {tax_year} tax thresholds below, provide a comprehensive UK tax analysis.
+
+UK TAX THRESHOLDS {tax_year}:
+{tax_context}
+
+EXTRACTED FINANCIAL DATA:
+{data_str}
+{condensed_note if condensed else ""}
+
+Please analyse and report on each of the following sections:
+
+1. INCOME TAX
+2. SAVINGS INTEREST
+3. DIVIDENDS
+4. CAPITAL GAINS TAX
+5. ISA USAGE
+6. PENSION CONTRIBUTIONS
+7. SELF-ASSESSMENT TRIGGERS
+8. TAX EFFICIENCY OPPORTUNITIES
+9. SUMMARY TABLE
+10. CAVEATS
+
+Be specific with amounts where the data allows. Flag all assumptions clearly."""
 
 
 def validate_and_normalize_extraction(raw_text: str) -> tuple[dict | None, str]:
@@ -467,31 +958,11 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     Returns a single string of all extracted text, or "" if the file cannot
     be read (e.g. it is password protected or a scanned image without OCR).
     """
-    text_parts = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            print(f"  Reading {Path(pdf_path).name}: {len(pdf.pages)} page(s)")
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                if tables:
-                    # Table mode: flatten each row into a pipe-separated string
-                    for table in tables:
-                        for row in table:
-                            if row:
-                                clean_row = [str(cell).strip() if cell else "" for cell in row]
-                                text_parts.append(" | ".join(clean_row))
-                else:
-                    # Plain text fallback
-                    text = page.extract_text()
-                    if text:
-                        text_parts.append(text)
-    except Exception as e:
-        print(f"  Warning: Could not read {pdf_path}: {e}")
-        return ""
-    return "\n".join(text_parts)
+    text, _ = extract_text_and_transactions_from_pdf(pdf_path, Path(pdf_path).name)
+    return text
 
 
-def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> dict[str, str]:
+def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> tuple[dict[str, str], list[dict]]:
     """
     Find, filter, deduplicate, and load all relevant PDF statements.
 
@@ -507,9 +978,10 @@ def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> dict[str,
          prevents the AI from being overwhelmed by irrelevant old data.
       5. Extract text from each surviving PDF.
 
-    Returns:
-      dict mapping relative file path (str) -> extracted text (str)
-      e.g. {"Lloyds Statements\\2024_April_Statement.pdf": "01 Apr..."}
+        Returns:
+            tuple:
+                - dict mapping relative file path (str) -> extracted text (str)
+                - list of normalized transaction rows for CSV export
     """
     folder = Path(pdf_folder)
 
@@ -551,16 +1023,18 @@ def load_all_statements(pdf_folder: str, tax_year: str = "2024-25") -> dict[str,
 
     # Step 5: Extract text from each relevant PDF
     statements = {}
+    normalized_rows = []
     for pdf_path in relevant_pdfs:
         try:
             rel_path = pdf_path.relative_to(folder)  # e.g. Lloyds\2024_April.pdf
         except ValueError:
             rel_path = pdf_path.name
-        text = extract_text_from_pdf(str(pdf_path))
+        text, rows = extract_text_and_transactions_from_pdf(str(pdf_path), str(rel_path))
         if text.strip():                              # Only store files with readable text
             statements[str(rel_path)] = text
+        normalized_rows.extend(rows)
 
-    return statements
+    return statements, normalized_rows
 
 
 # ── LM Studio Connection ──────────────────────────────────────────────────────
@@ -794,72 +1268,16 @@ def calculate_tax_implications(financial_data: dict, model: str, tax_year: str =
     """
     print("\nStep 2: Calculating UK tax implications...")
 
-    tax_context = json.dumps(UK_TAX, indent=2)
-    data_str    = json.dumps(financial_data, indent=2)
+    prompt = build_analysis_prompt(financial_data, tax_year, condensed=False)
+    analysis = ask_llm(ANALYSIS_SYSTEM, prompt, model)
 
-    prompt = f"""Using the extracted financial data and UK {tax_year} tax thresholds below,
-provide a comprehensive UK tax analysis.
+    if isinstance(analysis, str) and "400 Client Error" in analysis:
+        print("  Analysis context too large for model, retrying with condensed dataset...")
+        condensed_data = build_condensed_analysis_data(financial_data, max_items_per_type=25)
+        condensed_prompt = build_analysis_prompt(condensed_data, tax_year, condensed=True)
+        analysis = ask_llm(ANALYSIS_SYSTEM, condensed_prompt, model)
 
-UK TAX THRESHOLDS {tax_year}:
-{tax_context}
-
-EXTRACTED FINANCIAL DATA:
-{data_str}
-
-Please analyse and report on each of the following sections:
-
-1. INCOME TAX
-   - Total income identified
-   - Estimated tax band (basic / higher / additional rate)
-   - Estimated income tax liability
-   - Salary/PAYE already deducted (if visible in statements)
-
-2. SAVINGS INTEREST
-   - Total interest earned across all accounts
-   - Amount covered by the Personal Savings Allowance
-   - Taxable interest remaining (if any)
-   - Note: ISA interest is completely tax-free
-
-3. DIVIDENDS
-   - Total dividends received outside an ISA
-   - Amount covered by the £500 dividend allowance
-   - Taxable dividends and estimated tax at the relevant rate
-
-4. CAPITAL GAINS TAX
-   - Total gains identified
-   - Amount covered by the £3,000 Annual Exempt Amount
-   - Taxable gain and estimated CGT at the relevant rate
-
-5. ISA USAGE
-   - Total deposited into ISAs this tax year
-   - Remaining allowance of the £20,000 annual limit
-   - Estimated income and gains sheltered tax-free
-
-6. PENSION CONTRIBUTIONS
-   - Personal contributions identified
-   - Estimated tax relief received
-   - Whether within the £60,000 annual allowance
-
-7. SELF-ASSESSMENT TRIGGERS
-   - Whether a Self Assessment return is likely required
-   - Key reasons (e.g. income over £100k, untaxed income over £1k, CGT events)
-
-8. TAX EFFICIENCY OPPORTUNITIES
-   - Specific actionable suggestions based on this person's actual data
-   - For example: top up ISA, increase pension contributions before year end
-
-9. SUMMARY TABLE
-   - Estimated total tax liability broken down by category
-   - Key HMRC deadlines to be aware of
-
-10. CAVEATS
-    - What this analysis cannot see (employer pension, P11D, etc.)
-    - Strong recommendation to consult a professional tax adviser
-    - Reminder that this is an estimate only
-
-Be specific with amounts where the data allows. Flag all assumptions clearly."""
-
-    return ask_llm(ANALYSIS_SYSTEM, prompt, model)
+    return analysis
 
 
 # ── Report Generation ─────────────────────────────────────────────────────────
@@ -986,6 +1404,16 @@ def main():
         help="Output report filename (default: tax_report.md)"
     )
     parser.add_argument(
+        "--transactions-csv",
+        default="normalized_transactions.csv",
+        help="Output CSV filename for normalized statement rows (default: normalized_transactions.csv)"
+    )
+    parser.add_argument(
+        "--skip-llm-extraction",
+        action="store_true",
+        help="Skip LLM extraction and build financial events directly from normalized CSV rows"
+    )
+    parser.add_argument(
         "--tax-year",
         default="2024-25",
         help="Tax year label for filtering/reporting in format YYYY-YY (default: 2024-25)"
@@ -1006,6 +1434,7 @@ def main():
     print(f"  Model   : {args.model}")
     print(f"  Tax year: {tax_year_label(start_year, end_year)}")
     print(f"  Folder  : {args.pdf_folder}")
+    print(f"  CSV     : {args.transactions_csv}")
     print(f"  Output  : {args.output}")
 
     # Confirm LM Studio is reachable before doing any work
@@ -1017,11 +1446,21 @@ def main():
     print("  LM Studio is running.")
 
     # Load and filter PDFs from the statements folder
-    statements = load_all_statements(args.pdf_folder, tax_year=normalized_tax_year)
+    statements, normalized_rows = load_all_statements(args.pdf_folder, tax_year=normalized_tax_year)
     print(f"  Loaded {len(statements)} statement(s) with readable text.")
 
-    # Extract structured financial events from all statements (batched)
-    financial_data = extract_financial_data(statements, args.model)
+    # Persist normalized rows for deterministic auditability and downstream processing
+    export_transactions_csv(normalized_rows, args.transactions_csv)
+    print(f"  Exported {len(normalized_rows)} normalized row(s) to {args.transactions_csv}.")
+
+    # Extract structured financial events from statements (LLM) or CSV rows (deterministic)
+    if args.skip_llm_extraction:
+        print("\nStep 1: Building financial data from normalized CSV rows (LLM extraction skipped)...")
+        financial_data = extract_financial_data_from_transactions(normalized_rows)
+        extracted_count = sum(len(financial_data[k]) for k in EXTRACTION_LIST_KEYS)
+        print(f"  Deterministic extraction produced {extracted_count} financial event(s).")
+    else:
+        financial_data = extract_financial_data(statements, args.model)
 
     # Apply strict transaction-date filtering for the selected UK tax year
     financial_data, date_filter_stats = filter_financial_data_by_tax_year(financial_data, normalized_tax_year)

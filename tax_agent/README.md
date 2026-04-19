@@ -85,6 +85,12 @@ python tax_agent.py ./my_statements --model phi4-mini
 
 # Save report with a custom name
 python tax_agent.py ./statements --output 2024_tax_report.md
+
+# Export normalized statement rows to CSV
+python tax_agent.py ./statements --transactions-csv normalized_transactions.csv
+
+# Skip LLM extraction stage and build events from CSV rows deterministically
+python tax_agent.py ./statements --skip-llm-extraction --output tax_report_fast.md
 ```
 
 ---
@@ -106,7 +112,8 @@ For the most complete analysis, include PDFs from:
 
 The agent produces:
 1. **Terminal output** — analysis printed immediately
-2. **`tax_report.md`** — full report saved to disk, including:
+2. **`normalized_transactions.csv`** — normalized rows extracted from PDF tables
+3. **`tax_report.md`** — full report saved to disk, including:
    - Raw extracted financial data (JSON)
    - Full tax analysis with estimated liabilities
    - Self Assessment guidance
