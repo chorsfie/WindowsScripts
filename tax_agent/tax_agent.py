@@ -685,7 +685,7 @@ def save_processed_statement_index(csv_path: str, index: dict[str, str]) -> None
             })
 
 
-def summarize_taxable_savings(financial_data: dict, tax_year: str) -> dict:
+def summarize_taxable_savings(financial_data: dict, tax_year: str, savings_band_override: str = "auto") -> dict:
     """Estimate taxable vs non-taxable savings interest for a tax year."""
     interest_total = round(
         sum(float(item.get("amount", 0.0)) for item in financial_data.get("interest", []) if isinstance(item, dict)),
@@ -696,7 +696,16 @@ def summarize_taxable_savings(financial_data: dict, tax_year: str) -> dict:
         2,
     )
 
-    if income_total <= UK_TAX["basic_rate_limit"]:
+    if savings_band_override == "basic":
+        savings_allowance = UK_TAX["savings_allowance_basic"]
+        band = "basic"
+    elif savings_band_override == "higher":
+        savings_allowance = UK_TAX["savings_allowance_higher"]
+        band = "higher"
+    elif savings_band_override == "additional":
+        savings_allowance = 0
+        band = "additional"
+    elif income_total <= UK_TAX["basic_rate_limit"]:
         savings_allowance = UK_TAX["savings_allowance_basic"]
         band = "basic"
     elif income_total <= UK_TAX["higher_rate_limit"]:
@@ -716,7 +725,8 @@ def summarize_taxable_savings(financial_data: dict, tax_year: str) -> dict:
         "taxable_savings": taxable,
         "estimated_income_total": income_total,
         "estimated_income_band": band,
-        "assumption": "Savings allowance estimated from extracted income events only.",
+        "assumption": "Savings allowance estimated from extracted income events only unless an explicit taxpayer-band override is supplied.",
+        "band_source": "override" if savings_band_override != "auto" else "auto",
     }
 
 
@@ -745,6 +755,41 @@ def tax_year_sort_key(tax_year: str) -> tuple[int, int]:
     return (start, end)
 
 
+def format_currency(amount: float) -> str:
+    """Format GBP values consistently for reports."""
+    return f"£{amount:,.2f}"
+
+
+def build_html_savings_table(summaries: list[dict]) -> str:
+    """Render the rolling savings table as HTML for reliable markdown preview rendering."""
+    header = (
+        "<table>\n"
+        "  <thead>\n"
+        "    <tr>\n"
+        "      <th>Tax Year</th>\n"
+        "      <th>Total Savings Interest</th>\n"
+        "      <th>Non-Taxable Savings</th>\n"
+        "      <th>Taxable Savings</th>\n"
+        "      <th>Estimated Band</th>\n"
+        "    </tr>\n"
+        "  </thead>\n"
+        "  <tbody>"
+    )
+    rows = []
+    for row in summaries:
+        rows.append(
+            "    <tr>\n"
+            f"      <td>{row.get('tax_year', '')}</td>\n"
+            f"      <td>{format_currency(float(row.get('interest_total', 0.0)))}</td>\n"
+            f"      <td>{format_currency(float(row.get('non_taxable_savings', 0.0)))}</td>\n"
+            f"      <td>{format_currency(float(row.get('taxable_savings', 0.0)))}</td>\n"
+            f"      <td>{row.get('estimated_income_band', '')}</td>\n"
+            "    </tr>"
+        )
+    footer = "  </tbody>\n</table>"
+    return "\n".join([header, *rows, footer])
+
+
 def build_rolling_savings_report(report_paths: list[str], rolling_report_path: str, summary_csv_path: str) -> None:
     """Parse annual reports and generate rolling taxable/non-taxable savings table."""
     summaries = []
@@ -765,27 +810,30 @@ def build_rolling_savings_report(report_paths: list[str], rolling_report_path: s
         for row in summaries:
             writer.writerow({key: row.get(key, "") for key in YEARLY_SAVINGS_FIELDS})
 
-    table_lines = [
-        "| Tax Year | Total Savings Interest | Non-Taxable Savings | Taxable Savings | Estimated Band |",
-        "| --- | ---: | ---: | ---: | --- |",
-    ]
-    for row in summaries:
-        table_lines.append(
-            f"| {row.get('tax_year', '')} | £{float(row.get('interest_total', 0.0)):.2f} | "
-            f"£{float(row.get('non_taxable_savings', 0.0)):.2f} | "
-            f"£{float(row.get('taxable_savings', 0.0)):.2f} | {row.get('estimated_income_band', '')} |"
-        )
+    html_table = build_html_savings_table(summaries)
+
+    total_interest_all_years = sum(float(row.get("interest_total", 0.0)) for row in summaries)
+    total_taxable_all_years = sum(float(row.get("taxable_savings", 0.0)) for row in summaries)
+    peak_taxable = max((float(row.get("taxable_savings", 0.0)) for row in summaries), default=0.0)
 
     markdown = f"""# Rolling Savings Tax Report
 Generated: {now}
 
 This table is rebuilt by parsing yearly report files and reading each report's machine-readable savings summary.
 
-{os.linesep.join(table_lines)}
+## Annual View
+{html_table}
+
+## Totals
+- Combined savings interest across listed years: {format_currency(total_interest_all_years)}
+- Combined taxable savings across listed years: {format_currency(total_taxable_all_years)}
+- Highest single-year taxable savings: {format_currency(peak_taxable)}
 
 ## Notes
 - Figures are estimates based on extracted statement events.
 - Non-taxable/taxable split uses the Personal Savings Allowance estimate from each yearly report.
+- Income-band estimate excludes likely internal transfer credits when deriving savings allowance context.
+- Estimated band may be supplied manually when the taxpayer's rate band is known.
 """
 
     with open(rolling_report_path, "w", encoding="utf-8") as f:
@@ -824,6 +872,13 @@ def extract_financial_data_from_transactions(transactions: list[dict]) -> dict:
     summary_keywords = (
         "opening balance", "closing balance", "balance on", "money in", "money out", "summary",
     )
+    transfer_keywords = (
+        "from rainy", "rainy day", "hols", "holiday", "from c horsfield", "transfer", "payment",
+        "chase travel", "savings", "spends",
+    )
+
+    def is_likely_internal_transfer(desc_lower: str) -> bool:
+        return any(keyword in desc_lower for keyword in transfer_keywords)
 
     for row in transactions:
         date = row.get("date_iso", "")
@@ -901,6 +956,7 @@ def extract_financial_data_from_transactions(transactions: list[dict]) -> dict:
                 inflow_amount >= 250
                 and any(keyword in description_lower for keyword in incoming_keywords)
                 and not any(keyword in description_lower for keyword in outgoing_keywords)
+                and not is_likely_internal_transfer(description_lower)
             ):
                 income_type = "other"
 
@@ -1490,7 +1546,13 @@ def extract_financial_data(statements: dict[str, str], model: str) -> dict:
 
 # ── Tax Analysis ──────────────────────────────────────────────────────────────
 
-def calculate_tax_implications(financial_data: dict, model: str, tax_year: str = "2024-25", use_llm: bool = True) -> str:
+def calculate_tax_implications(
+    financial_data: dict,
+    model: str,
+    tax_year: str = "2024-25",
+    use_llm: bool = True,
+    savings_band_override: str = "auto",
+) -> str:
     """
     Send the merged financial data and UK tax thresholds to the AI for analysis.
 
@@ -1505,7 +1567,7 @@ def calculate_tax_implications(financial_data: dict, model: str, tax_year: str =
     print("\nStep 2: Calculating UK tax implications...")
 
     if not use_llm:
-        savings = summarize_taxable_savings(financial_data, tax_year)
+        savings = summarize_taxable_savings(financial_data, tax_year, savings_band_override=savings_band_override)
         return (
             f"## Deterministic Summary ({tax_year})\n\n"
             f"This summary was generated without an LLM to avoid context-window failures.\n\n"
@@ -1515,7 +1577,7 @@ def calculate_tax_implications(financial_data: dict, model: str, tax_year: str =
             f"- Taxable savings (estimated): £{savings['taxable_savings']:.2f}\n"
             f"- Estimated income band used: {savings['estimated_income_band']}\n\n"
             "Assumptions:\n"
-            "- Personal Savings Allowance estimated from extracted income events only.\n"
+            f"- Personal Savings Allowance band source: {savings['band_source']}.\n"
             "- Classification is a practical estimate, not filing advice.\n"
         )
 
@@ -1721,6 +1783,12 @@ def main():
         action="store_true",
         help="Disable processed statement tracking and always re-parse all PDFs"
     )
+    parser.add_argument(
+        "--savings-band-override",
+        choices=["auto", "basic", "higher", "additional"],
+        default="auto",
+        help="Override the savings allowance band used for taxable-savings estimates (default: auto)"
+    )
     args = parser.parse_args()
 
     requested_tax_years = []
@@ -1752,6 +1820,7 @@ def main():
     print(f"  Folder  : {args.pdf_folder}")
     print(f"  CSV     : {args.transactions_csv}")
     print(f"  Processed registry: {args.processed_statements_csv}")
+    print(f"  Savings band: {args.savings_band_override}")
     print(f"  Output  : {args.output}")
 
     # Confirm LM Studio only when LLM extraction or analysis is required.
@@ -1844,8 +1913,13 @@ def main():
             args.model,
             tax_year=tax_year,
             use_llm=not args.skip_llm_extraction,
+            savings_band_override=args.savings_band_override,
         )
-        savings_summary = summarize_taxable_savings(financial_data, tax_year)
+        savings_summary = summarize_taxable_savings(
+            financial_data,
+            tax_year,
+            savings_band_override=args.savings_band_override,
+        )
 
         year_output = build_year_output_path(args.output, tax_year, multi_year_mode)
         generate_report(
