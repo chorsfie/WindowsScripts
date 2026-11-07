@@ -1,0 +1,160 @@
+{
+  "normalize_remove_patterns": [
+    "\\bPAYPAL\\b",
+    "\\bCARD PAYMENT TO\\b",
+    "\\bCARD PURCHASE\\b",
+    "\\bVISA\\b",
+    "\\bDEBIT CARD\\b"
+  ],
+  "policy_hints": [
+    {
+      "tokens": ["ALLWYN", "ENT"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: National Lottery payments count as entertainment."
+    },
+    {
+      "tokens": ["BG", "SERVICES"],
+      "category": "Gas/Electricity",
+      "reason": "Policy hint: BG Services is British Gas/home services and counts as utilities."
+    },
+    {
+      "tokens": ["SKIDDLE"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: Skiddle purchases are concert/theatre tickets."
+    },
+    {
+      "tokens": ["DUNELM"],
+      "category": "House maintenance",
+      "reason": "Policy hint: Dunelm soft furnishings count as home/household spending."
+    },
+    {
+      "tokens": ["PLAYSTATIO"],
+      "category": "Pastimes/Sport/Hobbies expenses",
+      "reason": "Policy hint: PlayStation subscriptions are hobby/entertainment spend."
+    },
+    {
+      "tokens": ["LV", "PET"],
+      "category": "Pet Insurance",
+      "reason": "Policy hint: LV Pet is pet insurance."
+    },
+    {
+      "tokens": ["FUSE", "ENERGY"],
+      "category": "Gas/Electricity",
+      "reason": "Policy hint: Fuse Energy counts as gas/electricity utilities."
+    },
+    {
+      "tokens": ["LEWIS", "GREGSON"],
+      "category": "House maintenance",
+      "reason": "Policy hint: Lewis Gregson is window cleaning (house maintenance)."
+    },
+    {
+      "tokens": ["BARCLAYS", "PRTNR", "FIN"],
+      "category": "Mobile Phone",
+      "reason": "Policy hint: Barclays Partner Finance here is mobile phone finance."
+    },
+    {
+      "tokens": ["AMAZON", "PRIME"],
+      "category": "Memberships/Club fees",
+      "reason": "Policy hint: Amazon Prime is an annual subscription membership."
+    },
+    {
+      "tokens": ["EUI", "PET"],
+      "category": "Pet Insurance",
+      "reason": "Policy hint: EUI PET entries are pet insurance."
+    },
+    {
+      "tokens": ["TRADING", "212"],
+      "category": "Regular Savings - ISAs, Endowments etc",
+      "reason": "Policy hint: Trading 212 transfers are savings/investments."
+    },
+    {
+      "tokens": ["HANNAH", "PENNINGTON"],
+      "category": "Other Living Expenses",
+      "reason": "Policy hint: Hannah Pennington is dog grooming (pet care living expense)."
+    },
+    {
+      "tokens": ["PIC", "SAINS", "PET"],
+      "category": "Pet Insurance",
+      "reason": "Policy hint: PIC RE SAINS PET is pet insurance."
+    },
+    {
+      "tokens": ["RAMBLERS"],
+      "category": "Memberships/Club fees",
+      "reason": "Policy hint: Ramblers payment is yearly membership/charity fee."
+    },
+    {
+      "tokens": ["SIMARC", "PROPERTY"],
+      "category": "Mortgage/Rent",
+      "reason": "Policy hint: Simarc Property Management is ground rent."
+    },
+    {
+      "tokens": ["JENNIFER", "HUGHES"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: Jennifer Hughes transfers are shared entertainment costs."
+    },
+    {
+      "tokens": ["PAUL", "LAWSON"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: Paul Lawson transfers are shared entertainment costs."
+    },
+    {
+      "tokens": ["JOHN", "WRIGHT"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: John Wright transfers are shared entertainment costs."
+    },
+    {
+      "tokens": ["JOSH", "DAVISON"],
+      "category": "Entertainment - restaurant/cinema/pub etc",
+      "reason": "Policy hint: Josh Davison transfers are shared entertainment costs."
+    },
+    {
+      "tokens": ["STEVEN", "WEBSTER"],
+      "category": "House maintenance",
+      "reason": "Policy hint: Steven Webster is oven cleaning (house maintenance)."
+    },
+    {
+      "tokens": ["V12", "RETAIL", "FINANCE"],
+      "category": "Loans/Credit Cards/Car Lease/Other liabilities",
+      "reason": "Policy hint: V12 Retail Finance is sofa finance/liability."
+    },
+    {
+      "tokens": ["UKI", "CHURCHILL"],
+      "category": "Car Insurance",
+      "reason": "Policy hint: UKI t/a Churchill is car insurance."
+    },
+    {
+      "tokens": ["DECKERSEUR"],
+      "category": "Clothes",
+      "reason": "Policy hint: Deckers (UGG sandals) counts as clothing spend."
+    },
+    {
+      "tokens": ["TCS", "CONTRACTORS"],
+      "category": "House maintenance",
+      "reason": "Policy hint: TCS Contractors is bin cleaning (house maintenance)."
+    },
+    {
+      "tokens": ["MR", "LIAM", "HORSFIELD"],
+      "category": "Holidays/Trips",
+      "reason": "Policy hint: Liam Horsfield transfers are treated as holiday/trip spend."
+    }
+  ],
+  "retirement_excluded_categories": [
+    "Mortgage/Rent",
+    "Loans/Credit Cards/Car Lease/Other liabilities",
+    "TV/Satellite - Sky etc",
+    "Life Cover/Income Protection etc",
+    "Regular Savings - ISAs, Endowments etc",
+    "Gym"
+  ],
+  "category_comments": {
+    "Broadband/Phone landline": "Including TV",
+    "Mobile Phone": "Gone down to 2 phones now but bought Chris one on the tick",
+    "TV/Satellite - Sky etc": "Included in Broadband",
+    "Memberships/Club fees": "Paying for daughter now",
+    "Car /Travel Expenses/Petrol": "Commute to Leeds impacts this",
+    "Pet Insurance": "Mac has gone up loads",
+    "Regular Savings - ISAs, Endowments etc": "Includes ShareSave",
+    "Other Living Expenses": "Netflix/spotify/Amazon/Disney/Google",
+    "Gym": "In Membership/Club Fees"
+  }
+}

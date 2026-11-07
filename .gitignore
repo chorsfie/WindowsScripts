@@ -20,6 +20,15 @@ EpsteIn/EpsteIn.html
 
 # Script-generated outputs
 _Scripts/ConditionalAccessPolicies.csv
+_Scripts/bank_statements.csv
+_Scripts/categorized_transactions*.csv
+_Scripts/expense_breakdown*.csv
+_Scripts/expense_breakdown*.xlsx
+_Scripts/local_spending_analysis*.xlsx
+_Scripts/local_spending_analysis*.html
+_Scripts/normalized_transactions_local*.csv
+_Scripts/privacy_audit_local*.json
+_Scripts/~$*.xlsx
 WindowsScripts/Bank_AllAccounts_*.csv
 WindowsScripts/Bank_Summary_*.csv
 WindowsScripts/Bank_Summary_Report_*.md
