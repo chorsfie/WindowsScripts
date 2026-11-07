@@ -66,6 +66,7 @@ DISCRETIONARY_CATEGORIES = [
 
 ALL_CATEGORIES = ESSENTIAL_CATEGORIES + DISCRETIONARY_CATEGORIES
 DEFAULT_POLICY_JSON = Path(__file__).with_name("expense_policy_hints.json")
+DEFAULT_OUTPUT_FOLDER = r"G:\My Drive\Statements\Analysis Outputs\Local Statement Tool"
 
 BUILTIN_KEYWORD_RULES = [
     ("Mortgage/Rent", [r"\bRENT\b", r"\bMORTGAGE\b", r"\bGROUND RENT\b"]),
@@ -816,8 +817,11 @@ def main():
     )
     parser.add_argument(
         "--output-folder",
-        default=".",
-        help="Local output folder for Excel/HTML/CSV files.",
+        default=DEFAULT_OUTPUT_FOLDER,
+        help=(
+            "Local output folder for Excel/HTML/CSV files "
+            "(default: G:\\My Drive\\Statements\\Analysis Outputs\\Local Statement Tool)."
+        ),
     )
     parser.add_argument(
         "--year",

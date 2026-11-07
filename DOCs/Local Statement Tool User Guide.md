@@ -49,7 +49,7 @@ Statement sources (examples):
 
 Recommended output folder:
 
-- `G:\My Drive\Statements\Analysis Outputs\WindowsScripts`
+- `G:\My Drive\Statements\Analysis Outputs\Local Statement Tool`
 
 ## Run Command
 
@@ -57,7 +57,7 @@ Recommended output folder:
 & 'C:\Users\Craig\AppData\Local\Python\pythoncore-3.14-64\python.exe' `
   'C:\Users\Craig\GIT\_Scripts\local_statement_tool.py' `
   --input-folder 'G:\My Drive\Statements' `
-  --output-folder 'G:\My Drive\Statements\Analysis Outputs\WindowsScripts' `
+  --output-folder 'G:\My Drive\Statements\Analysis Outputs\Local Statement Tool' `
   --year 2026 `
   --policy-json 'C:\Users\Craig\GIT\_Scripts\expense_policy_hints.json' `
   --excel-name 'local_spending_analysis_2026.xlsx' `
@@ -65,6 +65,10 @@ Recommended output folder:
   --transactions-csv-name 'normalized_transactions_local_2026.csv' `
   --privacy-audit-json 'privacy_audit_local_2026.json'
 ```
+
+If `--output-folder` is omitted, the tool now defaults to:
+
+- `G:\My Drive\Statements\Analysis Outputs\Local Statement Tool`
 
 ## Outputs
 
