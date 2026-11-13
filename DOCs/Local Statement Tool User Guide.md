@@ -2,7 +2,7 @@
 
 This guide covers the local-only statement analysis tool in:
 
-- [_Scripts/local_statement_tool.py](C:/Users/Craig/GIT/_Scripts/local_statement_tool.py)
+- [_Scripts/local_statement_tool.py](_Scripts/local_statement_tool.py)
 
 ## Purpose
 
@@ -36,7 +36,7 @@ Privacy audit output is generated each run as JSON.
 Install:
 
 ```powershell
-& 'C:\Users\Craig\AppData\Local\Python\pythoncore-3.14-64\python.exe' -m pip install pypdf openpyxl
+py -m pip install pypdf openpyxl
 ```
 
 ## Recommended Folder Layout
@@ -51,15 +51,18 @@ Recommended output folder:
 
 - `G:\My Drive\Statements\Analysis Outputs\Local Statement Tool`
 
+Important: the tool automatically skips its own generated output folder when it is nested under the input folder, so it does not re-read Excel/HTML/CSV outputs created during the same run. This prevents double-counting and date distortions caused by ingesting generated report files.
+
 ## Run Command
 
 ```powershell
-& 'C:\Users\Craig\AppData\Local\Python\pythoncore-3.14-64\python.exe' `
-  'C:\Users\Craig\GIT\_Scripts\local_statement_tool.py' `
+$repoRoot = 'C:\path\to\your\repo'
+
+py "$repoRoot\_Scripts\local_statement_tool.py" `
   --input-folder 'G:\My Drive\Statements' `
   --output-folder 'G:\My Drive\Statements\Analysis Outputs\Local Statement Tool' `
   --year 2026 `
-  --policy-json 'C:\Users\Craig\GIT\_Scripts\expense_policy_hints.json' `
+  --policy-json "$repoRoot\_Scripts\expense_policy_hints.json" `
   --excel-name 'local_spending_analysis_2026.xlsx' `
   --html-name 'local_spending_analysis_2026.html' `
   --transactions-csv-name 'normalized_transactions_local_2026.csv' `
@@ -85,7 +88,7 @@ Categorization uses deterministic rules only:
 
 - Built-in keyword patterns in script
 - Optional policy hints in:
-  - [_Scripts/expense_policy_hints.json](C:/Users/Craig/GIT/_Scripts/expense_policy_hints.json)
+  - [_Scripts/expense_policy_hints.json](_Scripts/expense_policy_hints.json)
 
 No probabilistic/AI classification is used.
 

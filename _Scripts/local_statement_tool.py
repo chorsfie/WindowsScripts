@@ -178,7 +178,7 @@ def detect_pdf_provider(text: str) -> str:
     upper = text.upper()
     if "LLOYDS BANK" in upper and "YOUR TRANSACTIONS" in upper:
         return "lloyds"
-    if "CHASE IS A REGISTERED TRADEMARK" in upper or "CRAIG'S ACCOUNT STATEMENT" in upper:
+    if "CHASE IS A REGISTERED TRADEMARK" in upper or "ACCOUNT STATEMENT" in upper:
         return "chase"
     if "CAPITAL ONE" in upper and "YOUR TRANSACTION DETAILS" in upper:
         return "capital_one"
@@ -420,19 +420,34 @@ def normalize_merchant_name(description: str, normalize_patterns: list[str]) -> 
     return normalized[:40] if normalized else "UNKNOWN"
 
 
+def is_non_transaction_row(tx: Transaction) -> bool:
+    text = (tx.description or "").upper()
+    tx_type = tx.tx_type.upper()
+    if tx_type in {"TRANSFER", "INTEREST", "TFR", "FPO", "DEP"}:
+        if any(token in text for token in ("HORSFIELD", "CRAIG", "NOTTINGHAM", "TO CRAIG", "FROM CRAIG", "CRAIG'S ACCOUNT")):
+            return True
+        if tx_type in {"TRANSFER", "INTEREST"}:
+            return True
+    if "OPENING BALANCE" in text or "CLOSING BALANCE" in text or "BALANCE TRANSFER" in text:
+        return True
+    return False
+
+
 def analyse_transactions(transactions: list[Transaction], normalize_patterns, policy_hints):
-    for tx in transactions:
+    filtered_transactions = [tx for tx in transactions if not is_non_transaction_row(tx)]
+
+    for tx in filtered_transactions:
         tx.category, tx.category_reason = categorize_transaction(tx, normalize_patterns, policy_hints)
 
-    income_total = sum((tx.money_in for tx in transactions), Decimal("0"))
-    spending_total = sum((tx.money_out for tx in transactions), Decimal("0"))
+    income_total = sum((tx.money_in for tx in filtered_transactions), Decimal("0"))
+    spending_total = sum((tx.money_out for tx in filtered_transactions), Decimal("0"))
 
     monthly = defaultdict(lambda: {"income": Decimal("0"), "spending": Decimal("0"), "net": Decimal("0")})
     category_spend = defaultdict(Decimal)
     merchant_spend = defaultdict(Decimal)
     recurring_groups = defaultdict(list)
 
-    for tx in transactions:
+    for tx in filtered_transactions:
         month_key = tx.date.strftime("%Y-%m")
         monthly[month_key]["income"] += tx.money_in
         monthly[month_key]["spending"] += tx.money_out
@@ -546,29 +561,31 @@ def write_excel_report(output_path: Path, transactions: list[Transaction], analy
         for idx in range(2, len(analysis["monthly_rows"]) + 2):
             ws_monthly[f"{col}{idx}"].number_format = "£#,##0.00"
 
+    category_rows = analysis.get("category_rows", [])
+    month_rows = analysis.get("monthly_rows", [])
+
+    for row in month_rows:
+        month_label = row["month"].replace("-", " ")
+        month_sheet = wb.create_sheet(month_label)
+        add_table_headers(month_sheet, 1, ["Category", "Spending (£)"])
+        month_totals = defaultdict(Decimal)
+        for tx in sorted(transactions, key=lambda t: t.date):
+            if tx.date.strftime("%Y-%m") != row["month"]:
+                continue
+            if tx.money_out <= 0 or tx.category == "":
+                continue
+            month_totals[tx.category] += tx.money_out
+        for idx, (category, amount) in enumerate(sorted(month_totals.items(), key=lambda item: item[1], reverse=True), start=2):
+            month_sheet.cell(idx, 1, category)
+            month_sheet.cell(idx, 2, float(amount))
+            month_sheet.cell(idx, 2).number_format = "£#,##0.00"
+
     ws_cat = wb.create_sheet("Category Breakdown")
     add_table_headers(ws_cat, 1, ["Category", "Spending (£)"])
-    for idx, row in enumerate(analysis["category_rows"], start=2):
+    for idx, row in enumerate(category_rows, start=2):
         ws_cat.cell(idx, 1, row["category"])
         ws_cat.cell(idx, 2, float(row["spending"]))
         ws_cat.cell(idx, 2).number_format = "£#,##0.00"
-
-    ws_merch = wb.create_sheet("Top Merchants")
-    add_table_headers(ws_merch, 1, ["Merchant", "Spending (£)"])
-    for idx, row in enumerate(analysis["top_merchants"], start=2):
-        ws_merch.cell(idx, 1, row["merchant"])
-        ws_merch.cell(idx, 2, float(row["spending"]))
-        ws_merch.cell(idx, 2).number_format = "£#,##0.00"
-
-    ws_rec = wb.create_sheet("Recurring Payments")
-    add_table_headers(ws_rec, 1, ["Merchant", "Amount (£)", "Count", "Months", "Frequency"])
-    for idx, row in enumerate(analysis["recurring_rows"], start=2):
-        ws_rec.cell(idx, 1, row["merchant"])
-        ws_rec.cell(idx, 2, float(row["amount"]))
-        ws_rec.cell(idx, 3, row["count"])
-        ws_rec.cell(idx, 4, row["months"])
-        ws_rec.cell(idx, 5, row["frequency"])
-        ws_rec.cell(idx, 2).number_format = "£#,##0.00"
 
     ws_tx = wb.create_sheet("Transactions")
     add_table_headers(
@@ -620,6 +637,145 @@ def write_excel_report(output_path: Path, transactions: list[Transaction], analy
     ws_privacy.column_dimensions["D"].width = 90
 
     wb.save(output_path)
+
+
+def write_expense_breakdown_report(output_path: Path, transactions: list[Transaction], year: int, policy_path: Path):
+    policy_data = {}
+    if policy_path.exists():
+        try:
+            policy_data = json.loads(policy_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            policy_data = {}
+
+    category_comments = policy_data.get("category_comments", {})
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    def by_month_and_category(tx_list):
+        month_totals = defaultdict(lambda: defaultdict(Decimal))
+        for tx in tx_list:
+            if tx.money_out <= 0 or not tx.category:
+                continue
+            month = tx.date.strftime("%b")
+            month_totals[month][tx.category] += tx.money_out
+        return month_totals
+
+    ws_tx = Workbook()
+    ws = ws_tx.active
+    ws.title = "Transactions"
+    headers = ["Date", "Month", "Description", "Type", "Money Out (£)", "Category", "Group", "Category Reason"]
+    add_table_headers(ws, 1, headers)
+    for idx, tx in enumerate(sorted(transactions, key=lambda t: t.date), start=2):
+        if tx.money_out <= 0:
+            continue
+        ws.cell(idx, 1, tx.date.strftime("%d %b %Y"))
+        ws.cell(idx, 2, tx.date.strftime("%b"))
+        ws.cell(idx, 3, tx.description)
+        ws.cell(idx, 4, tx.tx_type)
+        ws.cell(idx, 5, float(tx.money_out))
+        ws.cell(idx, 6, tx.category)
+        ws.cell(idx, 7, "Essential" if tx.category in ESSENTIAL_CATEGORIES else "Discretionary")
+        ws.cell(idx, 8, tx.category_reason)
+        ws.cell(idx, 5).number_format = "£#,##0.00"
+
+    month_totals = by_month_and_category(transactions)
+    for month_index, month_name in enumerate(month_names, start=1):
+        month_key = month_name
+        ws_month = ws_tx.create_sheet(f"{month_name} {year}")
+        ws_month["A1"] = "Essential"
+        ws_month["B1"] = "2025"
+        ws_month["C1"] = "Current"
+        ws_month["D1"] = "In Retirement"
+        ws_month["E1"] = "Comments"
+
+        row_num = 2
+        for category in ESSENTIAL_CATEGORIES:
+            total = month_totals.get(month_key, {}).get(category, Decimal("0"))
+            ws_month.cell(row_num, 1, category)
+            ws_month.cell(row_num, 2, 0)
+            ws_month.cell(row_num, 3, float(total))
+            ws_month.cell(row_num, 4, 0)
+            ws_month.cell(row_num, 5, category_comments.get(category, ""))
+            ws_month.cell(row_num, 3).number_format = "£#,##0.00"
+            row_num += 1
+
+        ws_month.cell(row_num, 1, "TOTAL")
+        ws_month.cell(row_num, 3, float(sum(month_totals.get(month_key, {}).get(cat, Decimal("0")) for cat in ESSENTIAL_CATEGORIES)))
+        ws_month.cell(row_num, 3).number_format = "£#,##0.00"
+        row_num += 2
+
+        ws_month.cell(row_num, 1, "Discretionary")
+        ws_month.cell(row_num, 2, "2025")
+        ws_month.cell(row_num, 3, "Current")
+        ws_month.cell(row_num, 4, "In Retirement")
+        ws_month.cell(row_num, 5, "Comments")
+        row_num += 1
+
+        for category in DISCRETIONARY_CATEGORIES:
+            total = month_totals.get(month_key, {}).get(category, Decimal("0"))
+            ws_month.cell(row_num, 1, category)
+            ws_month.cell(row_num, 2, 0)
+            ws_month.cell(row_num, 3, float(total))
+            ws_month.cell(row_num, 4, 0)
+            ws_month.cell(row_num, 5, category_comments.get(category, ""))
+            ws_month.cell(row_num, 3).number_format = "£#,##0.00"
+            row_num += 1
+
+        ws_month.cell(row_num, 1, "TOTAL")
+        ws_month.cell(row_num, 3, float(sum(month_totals.get(month_key, {}).get(cat, Decimal("0")) for cat in DISCRETIONARY_CATEGORIES)))
+        ws_month.cell(row_num, 3).number_format = "£#,##0.00"
+        row_num += 2
+
+        ws_month.cell(row_num, 1, "GRAND TOTAL")
+        ws_month.cell(row_num, 3, float(sum(month_totals.get(month_key, {}).get(cat, Decimal("0")) for cat in ALL_CATEGORIES)))
+        ws_month.cell(row_num, 3).number_format = "£#,##0.00"
+
+    avg_ws = ws_tx.create_sheet(f"{year} Average")
+    avg_ws["A1"] = "Essential"
+    avg_ws["B1"] = "2025"
+    avg_ws["C1"] = "Current"
+    avg_ws["D1"] = "In Retirement"
+    avg_ws["E1"] = "Comments"
+
+    def avg_for_category(category: str):
+        month_values = [month_totals.get(month_names[i], {}).get(category, Decimal("0")) for i in range(12)]
+        if not month_values:
+            return Decimal("0")
+        return sum(month_values, Decimal("0")) / Decimal(len(month_values))
+
+    row_num = 2
+    for category in ESSENTIAL_CATEGORIES:
+        avg = avg_for_category(category)
+        avg_ws.cell(row_num, 1, category)
+        avg_ws.cell(row_num, 2, 0)
+        avg_ws.cell(row_num, 3, float(avg))
+        avg_ws.cell(row_num, 4, 0)
+        avg_ws.cell(row_num, 5, category_comments.get(category, ""))
+        avg_ws.cell(row_num, 3).number_format = "£#,##0.00"
+        row_num += 1
+    avg_ws.cell(row_num, 1, "TOTAL")
+    avg_ws.cell(row_num, 3, float(sum(avg_for_category(cat) for cat in ESSENTIAL_CATEGORIES)))
+    avg_ws.cell(row_num, 3).number_format = "£#,##0.00"
+    row_num += 2
+    avg_ws.cell(row_num, 1, "Discretionary")
+    row_num += 1
+    for category in DISCRETIONARY_CATEGORIES:
+        avg = avg_for_category(category)
+        avg_ws.cell(row_num, 1, category)
+        avg_ws.cell(row_num, 2, 0)
+        avg_ws.cell(row_num, 3, float(avg))
+        avg_ws.cell(row_num, 4, 0)
+        avg_ws.cell(row_num, 5, category_comments.get(category, ""))
+        avg_ws.cell(row_num, 3).number_format = "£#,##0.00"
+        row_num += 1
+    avg_ws.cell(row_num, 1, "TOTAL")
+    avg_ws.cell(row_num, 3, float(sum(avg_for_category(cat) for cat in DISCRETIONARY_CATEGORIES)))
+    avg_ws.cell(row_num, 3).number_format = "£#,##0.00"
+    row_num += 2
+    avg_ws.cell(row_num, 1, "GRAND TOTAL")
+    avg_ws.cell(row_num, 3, float(sum(avg_for_category(cat) for cat in ALL_CATEGORIES)))
+    avg_ws.cell(row_num, 3).number_format = "£#,##0.00"
+
+    ws_tx.save(output_path)
 
 
 def html_table(headers, rows):
@@ -766,14 +922,38 @@ def export_transactions_csv(path: Path, transactions: list[Transaction]):
             )
 
 
-def read_transactions_from_folder(input_folder: Path, year: Optional[int]):
+def should_skip_statement_file(path: Path) -> str | None:
+    lower_name = path.name.lower()
+    if any(marker in lower_name for marker in ("summary", "report", "tax_report", "allaccounts")):
+        return "Skipped summary/export file"
+    if any(marker in lower_name for marker in ("rainyday", "rainy day", "holidayspends", "holiday spends", "savings", "savings_")):
+        return "Skipped savings/holiday account statements"
+    return None
+
+
+def read_transactions_from_folder(input_folder: Path, output_folder: Optional[Path], year: Optional[int]):
     transactions: list[Transaction] = []
     scanned_files = 0
     skipped_files = 0
     skip_reasons = defaultdict(int)
+    output_root = output_folder.resolve() if output_folder is not None else None
+
     for path in input_folder.rglob("*"):
         if not path.is_file():
             continue
+
+        resolved_path = path.resolve()
+        if output_root is not None and resolved_path.is_relative_to(output_root):
+            skipped_files += 1
+            skip_reasons["Skipped generated output folder"] += 1
+            continue
+
+        skip_reason = should_skip_statement_file(path)
+        if skip_reason:
+            skipped_files += 1
+            skip_reasons[skip_reason] += 1
+            continue
+
         scanned_files += 1
         extension = path.suffix.lower()
         try:
@@ -792,7 +972,12 @@ def read_transactions_from_folder(input_folder: Path, year: Optional[int]):
                     rows = []
                 transactions.extend(rows)
             elif extension == ".csv":
-                transactions.extend(parse_csv_file(path))
+                parent_name = path.parent.name.lower()
+                if "statement" in parent_name or any(marker in path.name.lower() for marker in ("statement", "transaction")):
+                    transactions.extend(parse_csv_file(path))
+                else:
+                    skipped_files += 1
+                    skip_reasons["Skipped non-statement CSV export"] += 1
             else:
                 skipped_files += 1
                 skip_reasons["Unsupported file extension"] += 1
@@ -865,9 +1050,13 @@ def main():
     normalize_patterns, policy_hints = load_policy(policy_path)
     transactions, scanned_files, skipped_files, skip_reasons = read_transactions_from_folder(
         input_folder,
+        output_folder,
         args.year,
     )
     analysis = analyse_transactions(transactions, normalize_patterns, policy_hints)
+
+    year_name = str(args.year) if args.year is not None else "all"
+    year_filter = args.year
 
     excel_path = output_folder / args.excel_name
     html_path = output_folder / args.html_name
@@ -875,6 +1064,8 @@ def main():
     privacy_audit_json_path = output_folder / args.privacy_audit_json
 
     write_excel_report(excel_path, transactions, analysis)
+    expense_breakdown_path = output_folder / f"expense_breakdown_{year_name}.xlsx"
+    write_expense_breakdown_report(expense_breakdown_path, transactions, year_filter or datetime.now().year, policy_path)
     write_html_report(html_path, analysis)
     export_transactions_csv(transactions_csv_path, transactions)
     write_privacy_audit_json(privacy_audit_json_path)
